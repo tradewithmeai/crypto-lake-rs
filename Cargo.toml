@@ -1,0 +1,46 @@
+[package]
+name = "crypto-lake-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight crypto data collector and transformer"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket client
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Arrow / Parquet
+arrow = { version = "53", features = ["prettyprint"] }
+parquet = { version = "53", features = ["arrow", "snap"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# URL handling
+url = "2"
+
+# CLI args
+clap = { version = "4", features = ["derive"] }
+
+# Futures utilities
+futures-util = "0.3"
+
+# Error handling
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

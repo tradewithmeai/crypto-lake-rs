@@ -1,0 +1,55 @@
+##############################################################################
+# Crypto Lake Collector - Rust Configuration
+##############################################################################
+
+general:
+  timezone: "UTC"
+  log_level: "INFO"
+  base_path: "./data"
+
+exchanges:
+  - name: "binance"
+    symbols:
+      - SOLUSDT
+      - SUIUSDT
+      - ADAUSDT
+      - BTCUSDT
+      - ETHUSDT
+      - BNBUSDT
+      - XRPUSDT
+      - DOGEUSDT
+      - AVAXUSDT
+      - LINKUSDT
+      - LTCUSDT
+      - DOTUSDT
+      - EURUSDT
+    rest_url: "https://api.binance.com/api/v3"
+    wss_url: "wss://stream.binance.com:9443/ws"
+
+  - name: "coinbase"
+    symbols:
+      - BTC-USD
+      - ETH-USD
+      - SOL-USD
+    rest_url: "https://api.exchange.coinbase.com"
+    wss_url: "wss://ws-feed.exchange.coinbase.com"
+
+  - name: "kraken"
+    symbols:
+      - BTC/USD
+      - ETH/USD
+      - SOL/USD
+    rest_url: "https://api.kraken.com"
+    wss_url: "wss://ws.kraken.com/v2"
+
+collector:
+  write_interval_sec: 60
+  reconnect_backoff: 10
+  max_reconnect_backoff: 300
+  reconnect_jitter: 0.5
+  output_format: "jsonl"
+
+transformer:
+  resample_interval_sec: 1
+  parquet_compression: "snappy"
+  schedule_minutes: 60
