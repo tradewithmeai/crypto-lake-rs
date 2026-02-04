@@ -1,5 +1,8 @@
 use crate::collector::binance::TradeEvent;
+use crate::health::HealthCounters;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -86,7 +89,7 @@ impl BarAccumulator {
             volume_quote: self.volume_quote,
             trade_count: self.trade_count,
             vwap,
-            bid: 0.0,   // Updated from bookTicker stream separately
+            bid: 0.0,
             ask: 0.0,
             spread: 0.0,
         }
@@ -102,11 +105,11 @@ type BarKey = (String, String, i64); // (exchange, symbol, second_ts)
 /// completed bars to the parquet writer via the returned receiver.
 pub fn spawn_aggregator(
     mut trade_rx: mpsc::UnboundedReceiver<TradeEvent>,
+    counters: Arc<HealthCounters>,
 ) -> mpsc::UnboundedReceiver<Bar1s> {
     let (bar_tx, bar_rx) = mpsc::unbounded_channel::<Bar1s>();
 
     tokio::spawn(async move {
-        // Active accumulators: (exchange, symbol, second_ts) → accumulator
         let mut accumulators: HashMap<BarKey, BarAccumulator> = HashMap::new();
         let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(2));
         let mut total_bars = 0u64;
@@ -123,7 +126,6 @@ pub fn spawn_aggregator(
                         .or_insert_with(|| BarAccumulator::new(&trade, second_ts));
                 }
                 _ = flush_interval.tick() => {
-                    // Flush bars that are at least 2 seconds old
                     let cutoff = chrono::Utc::now().timestamp() - 2;
                     let stale_keys: Vec<BarKey> = accumulators
                         .keys()
@@ -131,6 +133,7 @@ pub fn spawn_aggregator(
                         .cloned()
                         .collect();
 
+                    let flushed = stale_keys.len() as u64;
                     for key in stale_keys {
                         if let Some(acc) = accumulators.remove(&key) {
                             let bar = acc.finalize();
@@ -140,6 +143,9 @@ pub fn spawn_aggregator(
                             }
                             let _ = bar_tx.send(bar);
                         }
+                    }
+                    if flushed > 0 {
+                        counters.bars_produced.fetch_add(flushed, Ordering::Relaxed);
                     }
                 }
             }

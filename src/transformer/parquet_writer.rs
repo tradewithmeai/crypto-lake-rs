@@ -8,7 +8,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, Duration};
 use tracing::{error, info};
 
@@ -36,12 +36,16 @@ fn bars_schema() -> Schema {
 ///
 /// Buffers completed 1-second bars in memory and flushes to Parquet files
 /// on the configured schedule (default: every hour).
+///
+/// Returns a oneshot sender for signalling shutdown (triggers final flush).
 pub fn spawn_parquet_writer(
     mut bar_rx: mpsc::UnboundedReceiver<Bar1s>,
     base_path: PathBuf,
     flush_interval_minutes: u64,
     compression: String,
-) {
+) -> oneshot::Sender<()> {
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
     tokio::spawn(async move {
         let mut buffer: Vec<Bar1s> = Vec::with_capacity(100_000);
         let mut flush_timer =
@@ -60,14 +64,29 @@ pub fn spawn_parquet_writer(
                         let bars = std::mem::replace(&mut buffer, Vec::with_capacity(100_000));
                         if let Err(e) = flush_to_parquet(&bars, &base_path, &compression).await {
                             error!("Parquet flush failed: {}", e);
-                            // Put bars back so we don't lose data
                             buffer.extend(bars);
                         }
                     }
                 }
+                _ = &mut shutdown_rx => {
+                    info!("Parquet writer: shutdown signal, flushing {} buffered bars...", buffer.len());
+                    // Drain any remaining bars from channel
+                    while let Ok(bar) = bar_rx.try_recv() {
+                        buffer.push(bar);
+                    }
+                    if !buffer.is_empty() {
+                        if let Err(e) = flush_to_parquet(&buffer, &base_path, &compression).await {
+                            error!("Parquet final flush failed: {}", e);
+                        }
+                    }
+                    info!("Parquet writer: shutdown complete");
+                    return;
+                }
             }
         }
     });
+
+    shutdown_tx
 }
 
 /// Write a batch of bars to partitioned Parquet files.

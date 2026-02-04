@@ -2,12 +2,15 @@ mod cleanup;
 mod collector;
 mod config;
 mod events;
+mod health;
 mod transformer;
 
 use clap::Parser;
 use config::Config;
+use health::HealthCounters;
 use std::path::PathBuf;
-use tracing::{error, info};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -24,6 +27,10 @@ struct Cli {
     /// Raw file retention in days (0 = no cleanup)
     #[arg(long, default_value = "3")]
     retention_days: i64,
+
+    /// Health report interval in seconds
+    #[arg(long, default_value = "60")]
+    health_interval: u64,
 }
 
 #[tokio::main]
@@ -54,18 +61,22 @@ async fn main() {
         cfg.exchanges.iter().map(|e| &e.name).collect::<Vec<_>>()
     );
 
-    // Spawn the rotating JSONL writer
-    let writer_tx = collector::writer::spawn_writer(
+    // Shared health counters
+    let counters = Arc::new(HealthCounters::default());
+
+    // Spawn the rotating JSONL writer (returns sender + shutdown handle)
+    let (writer_tx, writer_shutdown) = collector::writer::spawn_writer(
         data_path.clone(),
         cfg.collector.write_interval_sec,
+        counters.clone(),
     );
 
     // Spawn the trade aggregator (trades -> 1s bars)
     let (trade_tx, trade_rx) = tokio::sync::mpsc::unbounded_channel();
-    let bar_rx = transformer::aggregator::spawn_aggregator(trade_rx);
+    let bar_rx = transformer::aggregator::spawn_aggregator(trade_rx, counters.clone());
 
-    // Spawn the Parquet writer (1s bars -> Parquet files)
-    transformer::parquet_writer::spawn_parquet_writer(
+    // Spawn the Parquet writer (1s bars -> Parquet files, returns shutdown handle)
+    let parquet_shutdown = transformer::parquet_writer::spawn_parquet_writer(
         bar_rx,
         data_path.clone(),
         cfg.transformer.schedule_minutes,
@@ -87,9 +98,20 @@ async fn main() {
         info!("Cleanup: removing raw files older than {} days", retention);
     }
 
-    // Spawn exchange collectors
-    let mut handles = Vec::new();
+    // Collect exchange names and total symbol count for health
+    let exchange_names: Vec<String> = cfg.exchanges.iter().map(|e| e.name.clone()).collect();
+    let total_symbols: usize = cfg.exchanges.iter().map(|e| e.symbols.len()).sum();
 
+    // Spawn health writer
+    health::spawn_health_writer(
+        data_path.clone(),
+        counters.clone(),
+        exchange_names,
+        total_symbols,
+        cli.health_interval,
+    );
+
+    // Spawn exchange collectors
     // Binance (primary)
     if let Some(binance_cfg) = cfg.exchange("binance").cloned() {
         let wtx = writer_tx.clone();
@@ -98,14 +120,14 @@ async fn main() {
         let rb = cfg.collector.reconnect_backoff;
         let mrb = cfg.collector.max_reconnect_backoff;
         let rj = cfg.collector.reconnect_jitter;
+        let ctrs = counters.clone();
 
         let symbols_count = binance_cfg.symbols.len();
         info!("[binance] Starting collector for {} symbols", symbols_count);
 
-        let handle = tokio::spawn(async move {
-            collector::binance::run(binance_cfg, wtx, ttx, dp, rb, mrb, rj).await;
+        tokio::spawn(async move {
+            collector::binance::run(binance_cfg, wtx, ttx, dp, rb, mrb, rj, ctrs).await;
         });
-        handles.push(handle);
     }
 
     // TODO: Phase 4 - Add Coinbase and Kraken collectors here.
@@ -115,12 +137,29 @@ async fn main() {
     // Wait for shutdown signal
     match tokio::signal::ctrl_c().await {
         Ok(()) => {
-            info!("Shutdown signal received, flushing...");
+            info!("Shutdown signal received, flushing buffers...");
         }
         Err(e) => {
             error!("Error waiting for signal: {}", e);
         }
     }
+
+    // Graceful shutdown: flush writer and parquet buffers
+    drop(writer_tx);
+    drop(trade_tx);
+
+    // Signal writer to flush and wait
+    if let Err(e) = writer_shutdown.send(()) {
+        warn!("Writer already stopped: {:?}", e);
+    }
+    // Give writer a moment to flush
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // Signal parquet writer to flush and wait
+    if let Err(e) = parquet_shutdown.send(()) {
+        warn!("Parquet writer already stopped: {:?}", e);
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     info!("Shutdown complete.");
 }

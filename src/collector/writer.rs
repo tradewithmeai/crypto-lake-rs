@@ -1,9 +1,12 @@
+use crate::health::HealthCounters;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 /// A raw message to be written to JSONL.
@@ -17,17 +20,18 @@ pub struct RawMessage {
 /// Rotating JSONL writer that batches writes per file and rotates every `interval_sec`.
 ///
 /// File layout: `{base_path}/raw/{exchange}/{symbol}/{date}/{timestamp}.jsonl`
-pub struct RotatingWriter {
+struct RotatingWriter {
     base_path: PathBuf,
     interval_sec: u64,
-    /// Buffered lines per (exchange, symbol) → Vec<String>
+    /// Buffered lines per (exchange, symbol) -> Vec<String>
     buffers: HashMap<(String, String), Vec<String>>,
     /// Current rotation timestamp (start of current window)
     current_window: i64,
+    counters: Arc<HealthCounters>,
 }
 
 impl RotatingWriter {
-    pub fn new(base_path: PathBuf, interval_sec: u64) -> Self {
+    fn new(base_path: PathBuf, interval_sec: u64, counters: Arc<HealthCounters>) -> Self {
         let now = Utc::now().timestamp();
         let window = now - (now % interval_sec as i64);
         Self {
@@ -35,17 +39,18 @@ impl RotatingWriter {
             interval_sec,
             buffers: HashMap::new(),
             current_window: window,
+            counters,
         }
     }
 
     /// Add a line to the buffer.
-    pub fn push(&mut self, msg: RawMessage) {
+    fn push(&mut self, msg: RawMessage) {
         let key = (msg.exchange, msg.symbol);
         self.buffers.entry(key).or_default().push(msg.payload);
     }
 
     /// Check if the current rotation window has elapsed and flush if needed.
-    pub async fn maybe_rotate(&mut self) -> std::io::Result<()> {
+    async fn maybe_rotate(&mut self) -> std::io::Result<()> {
         let now = Utc::now().timestamp();
         let window = now - (now % self.interval_sec as i64);
 
@@ -57,7 +62,7 @@ impl RotatingWriter {
     }
 
     /// Flush all buffered lines to disk and clear buffers.
-    pub async fn flush(&mut self) -> std::io::Result<()> {
+    async fn flush(&mut self) -> std::io::Result<()> {
         if self.buffers.is_empty() {
             return Ok(());
         }
@@ -98,6 +103,9 @@ impl RotatingWriter {
         }
 
         if total_lines > 0 {
+            self.counters
+                .raw_lines_written
+                .fetch_add(total_lines as u64, Ordering::Relaxed);
             info!("Flushed {} raw lines to disk", total_lines);
         }
         Ok(())
@@ -106,15 +114,17 @@ impl RotatingWriter {
 
 /// Spawn the writer task that consumes from a channel and writes to disk.
 ///
-/// Returns a sender that collectors use to submit raw messages.
+/// Returns a sender for raw messages and a oneshot sender for shutdown signalling.
 pub fn spawn_writer(
     base_path: PathBuf,
     interval_sec: u64,
-) -> mpsc::UnboundedSender<RawMessage> {
+    counters: Arc<HealthCounters>,
+) -> (mpsc::UnboundedSender<RawMessage>, oneshot::Sender<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<RawMessage>();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        let mut writer = RotatingWriter::new(base_path, interval_sec);
+        let mut writer = RotatingWriter::new(base_path, interval_sec, counters);
         let mut rotate_interval =
             tokio::time::interval(std::time::Duration::from_secs(interval_sec));
 
@@ -128,9 +138,21 @@ pub fn spawn_writer(
                         warn!("Rotation error: {}", e);
                     }
                 }
+                _ = &mut shutdown_rx => {
+                    info!("Writer: shutdown signal received, flushing...");
+                    // Drain remaining messages
+                    while let Ok(msg) = rx.try_recv() {
+                        writer.push(msg);
+                    }
+                    if let Err(e) = writer.flush().await {
+                        warn!("Writer: final flush error: {}", e);
+                    }
+                    info!("Writer: final flush complete");
+                    return;
+                }
             }
         }
     });
 
-    tx
+    (tx, shutdown_tx)
 }

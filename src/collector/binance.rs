@@ -1,10 +1,13 @@
 use crate::collector::writer::RawMessage;
 use crate::config::Exchange;
 use crate::events;
+use crate::health::HealthCounters;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -24,6 +27,7 @@ pub async fn run(
     reconnect_backoff: u64,
     max_reconnect_backoff: u64,
     reconnect_jitter: f64,
+    counters: Arc<HealthCounters>,
 ) {
     let exchange_name = exchange_cfg.name.clone();
     let mut backoff = reconnect_backoff;
@@ -40,6 +44,7 @@ pub async fn run(
 
                 // Log reconnect event with gap duration
                 if let Some(disc_time) = last_disconnect.take() {
+                    counters.ws_reconnects.fetch_add(1, Ordering::Relaxed);
                     let gap = disc_time.elapsed().as_secs_f64();
                     events::log_connection_event(
                         &data_path.join("raw"),
@@ -66,11 +71,13 @@ pub async fn run(
                 while let Some(msg_result) = ws_read.next().await {
                     match msg_result {
                         Ok(Message::Text(text)) => {
+                            counters.messages_received.fetch_add(1, Ordering::Relaxed);
                             handle_message(
                                 &exchange_name,
                                 &text,
                                 &writer_tx,
                                 &trade_tx,
+                                &counters,
                             );
                         }
                         Ok(Message::Ping(data)) => {
@@ -92,6 +99,7 @@ pub async fn run(
                 }
 
                 // Disconnected
+                counters.ws_disconnects.fetch_add(1, Ordering::Relaxed);
                 last_disconnect = Some(Instant::now());
                 events::log_connection_event(
                     &data_path.join("raw"),
@@ -165,6 +173,7 @@ fn handle_message(
     text: &str,
     writer_tx: &mpsc::UnboundedSender<RawMessage>,
     trade_tx: &mpsc::UnboundedSender<TradeEvent>,
+    counters: &Arc<HealthCounters>,
 ) {
     // Combined stream wraps messages as: { "stream": "...", "data": {...} }
     let parsed: Value = match serde_json::from_str(text) {
@@ -208,6 +217,7 @@ fn handle_message(
 
     // If it's a trade, send to aggregator
     if stream.ends_with("@trade") {
+        counters.trades_received.fetch_add(1, Ordering::Relaxed);
         if let (Some(price_str), Some(qty_str), Some(buyer_maker)) = (
             data.get("p").and_then(|v| v.as_str()),
             data.get("q").and_then(|v| v.as_str()),
