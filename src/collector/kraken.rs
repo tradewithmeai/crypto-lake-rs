@@ -245,28 +245,9 @@ fn handle_message(
                 });
             }
         }
-    } else if channel == "ticker" {
-        for tick in data {
-            let symbol = tick.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            if symbol.is_empty() {
-                continue;
-            }
-            let safe_symbol = symbol.replace('/', "-");
-
-            let mut raw = tick.clone();
-            if let Some(obj) = raw.as_object_mut() {
-                obj.insert("_recv_ts".to_string(), Value::String(recv_ts.clone()));
-                obj.insert("_exchange".to_string(), Value::String(exchange.to_string()));
-                obj.insert("_channel".to_string(), Value::String("ticker".to_string()));
-            }
-            let payload = serde_json::to_string(&raw).unwrap_or_default();
-            let _ = writer_tx.send(RawMessage {
-                exchange: exchange.to_string(),
-                symbol: safe_symbol,
-                payload,
-            });
-        }
     }
+    // Skip ticker channel from raw writes to save storage
+    // (bookTicker data still feeds the aggregator for bid/ask in Parquet bars)
 }
 
 fn parse_iso_to_epoch_ms(s: &str) -> Option<i64> {

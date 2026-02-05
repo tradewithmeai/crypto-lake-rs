@@ -51,5 +51,5 @@ collector:
 
 transformer:
   resample_interval_sec: 1
-  parquet_compression: "snappy"
+  parquet_compression: "zstd"
   schedule_minutes: 60

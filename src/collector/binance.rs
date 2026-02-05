@@ -198,22 +198,26 @@ fn handle_message(
         return;
     }
 
-    // Build the raw JSONL line (matching Python format)
-    let recv_ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-    let mut raw = data.clone();
-    if let Some(obj) = raw.as_object_mut() {
-        obj.insert("_recv_ts".to_string(), Value::String(recv_ts));
-        obj.insert("_exchange".to_string(), Value::String(exchange.to_string()));
+    // Skip bookTicker from raw writes to save storage (still feeds aggregator below)
+    // Only write trades to raw JSONL files
+    if stream.ends_with("@trade") {
+        // Build the raw JSONL line (matching Python format)
+        let recv_ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+        let mut raw = data.clone();
+        if let Some(obj) = raw.as_object_mut() {
+            obj.insert("_recv_ts".to_string(), Value::String(recv_ts));
+            obj.insert("_exchange".to_string(), Value::String(exchange.to_string()));
+        }
+
+        let payload = serde_json::to_string(&raw).unwrap_or_default();
+
+        // Send to writer
+        let _ = writer_tx.send(RawMessage {
+            exchange: exchange.to_string(),
+            symbol: symbol.clone(),
+            payload,
+        });
     }
-
-    let payload = serde_json::to_string(&raw).unwrap_or_default();
-
-    // Send to writer
-    let _ = writer_tx.send(RawMessage {
-        exchange: exchange.to_string(),
-        symbol: symbol.clone(),
-        payload,
-    });
 
     // If it's a trade, send to aggregator
     if stream.ends_with("@trade") {

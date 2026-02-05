@@ -1,13 +1,14 @@
 use crate::health::HealthCounters;
 use chrono::Utc;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::fs::{self, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::fs;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
+use zstd::stream::Encoder;
 
 /// A raw message to be written to JSONL.
 #[derive(Debug)]
@@ -61,7 +62,7 @@ impl RotatingWriter {
         Ok(())
     }
 
-    /// Flush all buffered lines to disk and clear buffers.
+    /// Flush all buffered lines to disk with zstd compression and clear buffers.
     async fn flush(&mut self) -> std::io::Result<()> {
         if self.buffers.is_empty() {
             return Ok(());
@@ -84,20 +85,29 @@ impl RotatingWriter {
                 .join(&date_str);
             fs::create_dir_all(&dir).await?;
 
-            let file_path = dir.join(format!("{}.jsonl", ts_str));
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&file_path)
-                .await?;
-
+            // Write compressed .jsonl.zst file
+            let file_path = dir.join(format!("{}.jsonl.zst", ts_str));
             let data = lines.join("\n") + "\n";
-            file.write_all(data.as_bytes()).await?;
-            total_lines += lines.len();
+
+            // Use blocking file I/O for zstd compression (spawn_blocking for async context)
+            let file_path_clone = file_path.clone();
+            let line_count = lines.len();
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let file = std::fs::File::create(&file_path_clone)?;
+                // Compression level 3 is a good balance of speed and compression
+                let mut encoder = Encoder::new(file, 3)?;
+                encoder.write_all(data.as_bytes())?;
+                encoder.finish()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+
+            total_lines += line_count;
 
             debug!(
-                "Wrote {} lines to {:?}",
-                lines.len(),
+                "Wrote {} lines to {:?} (zstd compressed)",
+                line_count,
                 file_path.file_name().unwrap_or_default()
             );
         }
@@ -106,7 +116,7 @@ impl RotatingWriter {
             self.counters
                 .raw_lines_written
                 .fetch_add(total_lines as u64, Ordering::Relaxed);
-            info!("Flushed {} raw lines to disk", total_lines);
+            info!("Flushed {} raw lines to disk (zstd)", total_lines);
         }
         Ok(())
     }

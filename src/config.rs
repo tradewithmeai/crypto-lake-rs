@@ -69,7 +69,7 @@ fn default_max_reconnect_backoff() -> u64 { 300 }
 fn default_reconnect_jitter() -> f64 { 0.5 }
 fn default_output_format() -> String { "jsonl".into() }
 fn default_resample_interval() -> u64 { 1 }
-fn default_parquet_compression() -> String { "snappy".into() }
+fn default_parquet_compression() -> String { "zstd".into() }
 fn default_schedule_minutes() -> u64 { 60 }
 
 // ── Loader ──────────────────────────────────────────────────────────────────

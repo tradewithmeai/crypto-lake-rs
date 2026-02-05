@@ -179,23 +179,23 @@ fn handle_message(
         return;
     }
 
-    // Build raw JSONL line
-    let recv_ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-    let mut raw = parsed.clone();
-    if let Some(obj) = raw.as_object_mut() {
-        obj.insert("_recv_ts".to_string(), Value::String(recv_ts));
-        obj.insert("_exchange".to_string(), Value::String(exchange.to_string()));
-    }
-
-    let payload = serde_json::to_string(&raw).unwrap_or_default();
-    let _ = writer_tx.send(RawMessage {
-        exchange: exchange.to_string(),
-        symbol: symbol.to_string(),
-        payload,
-    });
-
+    // Skip ticker from raw writes to save storage, only write trades
     // Parse trades (match/last_match)
     if matches!(msg_type, "match" | "last_match") {
+        // Write raw JSONL for trades only
+        let recv_ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+        let mut raw = parsed.clone();
+        if let Some(obj) = raw.as_object_mut() {
+            obj.insert("_recv_ts".to_string(), Value::String(recv_ts));
+            obj.insert("_exchange".to_string(), Value::String(exchange.to_string()));
+        }
+        let payload = serde_json::to_string(&raw).unwrap_or_default();
+        let _ = writer_tx.send(RawMessage {
+            exchange: exchange.to_string(),
+            symbol: symbol.to_string(),
+            payload,
+        });
+
         counters.trades_received.fetch_add(1, Ordering::Relaxed);
 
         let price = parsed
