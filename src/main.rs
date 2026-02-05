@@ -130,7 +130,41 @@ async fn main() {
         });
     }
 
-    // TODO: Phase 4 - Add Coinbase and Kraken collectors here.
+    // Coinbase (backup)
+    if let Some(coinbase_cfg) = cfg.exchange("coinbase").cloned() {
+        let wtx = writer_tx.clone();
+        let ttx = trade_tx.clone();
+        let dp = data_path.clone();
+        let rb = cfg.collector.reconnect_backoff;
+        let mrb = cfg.collector.max_reconnect_backoff;
+        let rj = cfg.collector.reconnect_jitter;
+        let ctrs = counters.clone();
+
+        let symbols_count = coinbase_cfg.symbols.len();
+        info!("[coinbase] Starting collector for {} symbols", symbols_count);
+
+        tokio::spawn(async move {
+            collector::coinbase::run(coinbase_cfg, wtx, ttx, dp, rb, mrb, rj, ctrs).await;
+        });
+    }
+
+    // Kraken (backup)
+    if let Some(kraken_cfg) = cfg.exchange("kraken").cloned() {
+        let wtx = writer_tx.clone();
+        let ttx = trade_tx.clone();
+        let dp = data_path.clone();
+        let rb = cfg.collector.reconnect_backoff;
+        let mrb = cfg.collector.max_reconnect_backoff;
+        let rj = cfg.collector.reconnect_jitter;
+        let ctrs = counters.clone();
+
+        let symbols_count = kraken_cfg.symbols.len();
+        info!("[kraken] Starting collector for {} symbols", symbols_count);
+
+        tokio::spawn(async move {
+            collector::kraken::run(kraken_cfg, wtx, ttx, dp, rb, mrb, rj, ctrs).await;
+        });
+    }
 
     info!("Collector running. Press Ctrl+C to stop.");
 
