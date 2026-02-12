@@ -16,6 +16,10 @@ pub struct HealthCounters {
     pub raw_lines_written: AtomicU64,
     pub ws_disconnects: AtomicU64,
     pub ws_reconnects: AtomicU64,
+    /// Total bytes received from WebSocket streams (network usage).
+    pub bytes_received: AtomicU64,
+    /// Total bytes written to disk (after compression).
+    pub bytes_written: AtomicU64,
 }
 
 /// JSON health payload compatible with the Python health report format.

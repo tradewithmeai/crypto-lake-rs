@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto Lake</title>
+    <link rel="icon" href="/static/favicon.ico" sizes="48x48">
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+    <link rel="manifest" href="/static/site.webmanifest">
+    <meta name="theme-color" content="#131722">
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body>
+    <!-- Auth overlay -->
+    <div id="auth-overlay" class="auth-overlay" style="display: none;">
+        <div class="auth-card">
+            <h2 class="auth-title">Crypto Lake</h2>
+            <div id="google-signin-container" style="display: none;">
+                <div id="google-signin-btn"></div>
+                <div class="auth-divider"><span>or</span></div>
+            </div>
+            <div class="auth-tabs">
+                <button class="auth-tab active" data-tab="login">Login</button>
+                <button class="auth-tab" data-tab="register">Register</button>
+            </div>
+            <form id="login-form" class="auth-form">
+                <input type="text" id="login-username" placeholder="Username" required autocomplete="username">
+                <input type="password" id="login-password" placeholder="Password" required autocomplete="current-password">
+                <button type="submit" class="auth-submit">Login</button>
+                <div id="login-error" class="auth-error"></div>
+            </form>
+            <form id="register-form" class="auth-form" style="display: none;">
+                <input type="text" id="reg-username" placeholder="Username" required autocomplete="username">
+                <input type="email" id="reg-email" placeholder="Email" required autocomplete="email">
+                <input type="password" id="reg-password" placeholder="Password (min 8 chars)" required autocomplete="new-password">
+                <button type="submit" class="auth-submit">Register</button>
+                <div id="register-error" class="auth-error"></div>
+            </form>
+        </div>
+    </div>
+
+    <header>
+        <span class="logo">Crypto Lake</span>
+        <div class="controls">
+            <select id="exchange-select"></select>
+            <select id="symbol-select"></select>
+            <div class="tf-buttons">
+                <button class="tf-btn" data-tf="1m">1m</button>
+                <button class="tf-btn active" data-tf="5m">5m</button>
+                <button class="tf-btn" data-tf="15m">15m</button>
+                <button class="tf-btn" data-tf="1h">1h</button>
+            </div>
+            <div class="price-display">
+                <span id="live-price">--</span>
+                <span id="price-change">--</span>
+                <span class="status-dot" id="ws-status" title="WebSocket status"></span>
+                <span id="gap-indicator" class="gap-indicator" style="display: none;" title="Data gaps detected"></span>
+            </div>
+            <div class="user-menu" id="user-menu" style="display: none;">
+                <span id="username-display"></span>
+                <button id="logout-btn" class="logout-btn">Logout</button>
+            </div>
+        </div>
+    </header>
+    <div id="chart-container">
+        <div class="loading">Loading chart data...</div>
+    </div>
+    <script src="/static/js/lightweight-charts.standalone.production.js"></script>
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>

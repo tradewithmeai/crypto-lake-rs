@@ -92,17 +92,19 @@ impl RotatingWriter {
             // Use blocking file I/O for zstd compression (spawn_blocking for async context)
             let file_path_clone = file_path.clone();
             let line_count = lines.len();
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let compressed_size = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
                 let file = std::fs::File::create(&file_path_clone)?;
                 // Compression level 3 is a good balance of speed and compression
                 let mut encoder = Encoder::new(file, 3)?;
                 encoder.write_all(data.as_bytes())?;
                 encoder.finish()?;
-                Ok(())
+                let meta = std::fs::metadata(&file_path_clone)?;
+                Ok(meta.len())
             })
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
 
+            self.counters.bytes_written.fetch_add(compressed_size, Ordering::Relaxed);
             total_lines += line_count;
 
             debug!(

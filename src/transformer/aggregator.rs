@@ -1,4 +1,4 @@
-use crate::collector::binance::TradeEvent;
+use crate::collector::TradeEvent;
 use crate::health::HealthCounters;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;

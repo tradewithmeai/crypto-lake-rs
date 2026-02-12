@@ -39,8 +39,18 @@ clap = { version = "4", features = ["derive"] }
 # Futures utilities
 futures-util = "0.3"
 
+# HTTP / WebSocket server
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+tower = "0.4"
+
 # Error handling
 anyhow = "1"
+
+# System tray (Windows only)
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.19"
+open = "5"
 
 [profile.release]
 opt-level = 3

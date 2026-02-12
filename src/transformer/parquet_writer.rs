@@ -1,5 +1,5 @@
 use crate::transformer::aggregator::Bar1s;
-use arrow::array::{Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{Float64Array, StringArray, TimestampMicrosecondArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Datelike};
@@ -15,7 +15,7 @@ use tracing::{error, info};
 /// Schema matching the Python Parquet output exactly.
 fn bars_schema() -> Schema {
     Schema::new(vec![
-        Field::new("ts", DataType::Int64, false),
+        Field::new("window_start", DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())), false),
         Field::new("exchange", DataType::Utf8, false),
         Field::new("symbol", DataType::Utf8, false),
         Field::new("open", DataType::Float64, false),
@@ -159,7 +159,7 @@ fn write_parquet_file(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let schema = Arc::new(bars_schema());
 
-    let ts: Vec<i64> = bars.iter().map(|b| b.ts).collect();
+    let window_start: Vec<i64> = bars.iter().map(|b| b.ts * 1_000_000).collect();
     let exchange: Vec<&str> = bars.iter().map(|b| b.exchange.as_str()).collect();
     let symbol: Vec<&str> = bars.iter().map(|b| b.symbol.as_str()).collect();
     let open: Vec<f64> = bars.iter().map(|b| b.open).collect();
@@ -177,7 +177,7 @@ fn write_parquet_file(
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int64Array::from(ts)),
+            Arc::new(TimestampMicrosecondArray::from(window_start).with_timezone("UTC")),
             Arc::new(StringArray::from(exchange)),
             Arc::new(StringArray::from(symbol)),
             Arc::new(Float64Array::from(open)),

@@ -9,6 +9,17 @@ pub struct Config {
     pub exchanges: Vec<Exchange>,
     pub collector: Collector,
     pub transformer: Transformer,
+    #[serde(default)]
+    pub server: Server,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct Server {
+    #[serde(default = "default_server_port")]
+    pub port: u16,
+    #[serde(default = "default_static_dir")]
+    pub static_dir: String,
 }
 
 #[allow(dead_code)]
@@ -64,13 +75,24 @@ fn default_timezone() -> String { "UTC".into() }
 fn default_log_level() -> String { "INFO".into() }
 fn default_base_path() -> String { "./data".into() }
 fn default_write_interval() -> u64 { 60 }
-fn default_reconnect_backoff() -> u64 { 10 }
-fn default_max_reconnect_backoff() -> u64 { 300 }
-fn default_reconnect_jitter() -> f64 { 0.5 }
+fn default_reconnect_backoff() -> u64 { 2 }
+fn default_max_reconnect_backoff() -> u64 { 60 }
+fn default_reconnect_jitter() -> f64 { 0.3 }
 fn default_output_format() -> String { "jsonl".into() }
 fn default_resample_interval() -> u64 { 1 }
 fn default_parquet_compression() -> String { "zstd".into() }
 fn default_schedule_minutes() -> u64 { 60 }
+fn default_server_port() -> u16 { 8000 }
+fn default_static_dir() -> String { "./static".into() }
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            port: default_server_port(),
+            static_dir: default_static_dir(),
+        }
+    }
+}
 
 // ── Loader ──────────────────────────────────────────────────────────────────
 

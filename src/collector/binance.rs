@@ -1,3 +1,4 @@
+use super::TradeEvent;
 use crate::collector::writer::RawMessage;
 use crate::config::Exchange;
 use crate::events;
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -23,6 +24,7 @@ pub async fn run(
     exchange_cfg: Exchange,
     writer_tx: mpsc::UnboundedSender<RawMessage>,
     trade_tx: mpsc::UnboundedSender<TradeEvent>,
+    broadcast_tx: broadcast::Sender<TradeEvent>,
     data_path: PathBuf,
     reconnect_backoff: u64,
     max_reconnect_backoff: u64,
@@ -72,11 +74,13 @@ pub async fn run(
                     match msg_result {
                         Ok(Message::Text(text)) => {
                             counters.messages_received.fetch_add(1, Ordering::Relaxed);
+                            counters.bytes_received.fetch_add(text.len() as u64, Ordering::Relaxed);
                             handle_message(
                                 &exchange_name,
                                 &text,
                                 &writer_tx,
                                 &trade_tx,
+                                &broadcast_tx,
                                 &counters,
                             );
                         }
@@ -140,18 +144,6 @@ pub async fn run(
     }
 }
 
-/// A parsed trade for the aggregator.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct TradeEvent {
-    pub exchange: String,
-    pub symbol: String,
-    pub price: f64,
-    pub qty: f64,
-    pub timestamp_ms: i64,
-    pub is_buyer_maker: bool,
-}
-
 /// Build the Binance combined stream URL for all symbols.
 fn build_stream_url(cfg: &Exchange) -> String {
     // Combined stream: wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookTicker/...
@@ -173,6 +165,7 @@ fn handle_message(
     text: &str,
     writer_tx: &mpsc::UnboundedSender<RawMessage>,
     trade_tx: &mpsc::UnboundedSender<TradeEvent>,
+    broadcast_tx: &broadcast::Sender<TradeEvent>,
     counters: &Arc<HealthCounters>,
 ) {
     // Combined stream wraps messages as: { "stream": "...", "data": {...} }
@@ -229,14 +222,16 @@ fn handle_message(
         ) {
             let ts_ms = data.get("T").and_then(|v| v.as_i64()).unwrap_or(0);
             if let (Ok(price), Ok(qty)) = (price_str.parse::<f64>(), qty_str.parse::<f64>()) {
-                let _ = trade_tx.send(TradeEvent {
+                let trade = TradeEvent {
                     exchange: exchange.to_string(),
                     symbol,
                     price,
                     qty,
                     timestamp_ms: ts_ms,
                     is_buyer_maker: buyer_maker,
-                });
+                };
+                let _ = broadcast_tx.send(trade.clone());
+                let _ = trade_tx.send(trade);
             }
         }
     }

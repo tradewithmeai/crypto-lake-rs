@@ -44,12 +44,16 @@ exchanges:
 
 collector:
   write_interval_sec: 60
-  reconnect_backoff: 10
-  max_reconnect_backoff: 300
-  reconnect_jitter: 0.5
+  reconnect_backoff: 2
+  max_reconnect_backoff: 60
+  reconnect_jitter: 0.3
   output_format: "jsonl"
 
 transformer:
   resample_interval_sec: 1
   parquet_compression: "zstd"
-  schedule_minutes: 60
+  schedule_minutes: 1
+
+server:
+  port: 8000
+  static_dir: "./static"
