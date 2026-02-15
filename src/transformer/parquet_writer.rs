@@ -13,7 +13,7 @@ use tokio::time::{self, Duration};
 use tracing::{error, info};
 
 /// Schema matching the Python Parquet output exactly.
-fn bars_schema() -> Schema {
+pub fn bars_schema() -> Schema {
     Schema::new(vec![
         Field::new("window_start", DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())), false),
         Field::new("exchange", DataType::Utf8, false),
@@ -152,7 +152,7 @@ async fn flush_to_parquet(
 }
 
 /// Write a single Parquet file from a slice of bars (blocking I/O, called from async context).
-fn write_parquet_file(
+pub fn write_parquet_file(
     path: &Path,
     bars: &[&Bar1s],
     compression: Compression,
@@ -202,6 +202,66 @@ fn write_parquet_file(
     let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
     writer.write(&batch)?;
     writer.close()?;
+
+    Ok(())
+}
+
+/// Write a batch of Bar1s to partitioned Parquet files (used by backfill).
+///
+/// Groups bars by (exchange, symbol, date) and writes each group to its own file.
+pub async fn write_bars(
+    bars: &[Bar1s],
+    base_path: &Path,
+    compression: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if bars.is_empty() {
+        return Ok(());
+    }
+
+    // Group bars by (exchange, symbol, date)
+    let mut groups: std::collections::HashMap<(String, String, String), Vec<&Bar1s>> =
+        std::collections::HashMap::new();
+
+    for bar in bars {
+        let dt = DateTime::from_timestamp(bar.ts, 0)
+            .unwrap_or_default()
+            .naive_utc();
+        let date_key = format!(
+            "year={}/month={:02}/day={:02}",
+            dt.year(),
+            dt.month(),
+            dt.day()
+        );
+        let key = (bar.exchange.clone(), bar.symbol.clone(), date_key);
+        groups.entry(key).or_default().push(bar);
+    }
+
+    let comp = match compression.to_lowercase().as_str() {
+        "snappy" => Compression::SNAPPY,
+        "gzip" => Compression::GZIP(Default::default()),
+        "zstd" => Compression::ZSTD(Default::default()),
+        _ => Compression::SNAPPY,
+    };
+
+    for ((exchange, symbol, date_partition), group) in &groups {
+        let dir = base_path
+            .join("parquet")
+            .join(exchange)
+            .join(symbol)
+            .join(date_partition);
+        tokio::fs::create_dir_all(&dir).await?;
+
+        let ts_str = chrono::Utc::now().format("%Y%m%dT%H%M%S_backfill").to_string();
+        let file_path = dir.join(format!("{}.parquet", ts_str));
+
+        write_parquet_file(&file_path, group, comp)?;
+
+        info!(
+            "Backfill: wrote {} bars to {:?}",
+            group.len(),
+            file_path.file_name().unwrap_or_default()
+        );
+    }
 
     Ok(())
 }

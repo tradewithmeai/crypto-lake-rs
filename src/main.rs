@@ -1,3 +1,4 @@
+mod backfill;
 mod cleanup;
 mod collector;
 mod config;
@@ -5,6 +6,8 @@ mod events;
 mod health;
 mod server;
 mod transformer;
+#[cfg(windows)]
+mod autostart;
 #[cfg(windows)]
 mod tray;
 
@@ -40,10 +43,51 @@ struct Cli {
     /// Disable system tray icon (console-only mode)
     #[arg(long)]
     no_tray: bool,
+
+    /// Skip startup backfill
+    #[arg(long)]
+    no_backfill: bool,
+
+    /// Install auto-start on Windows boot and exit
+    #[arg(long)]
+    install_autostart: bool,
+
+    /// Remove auto-start from Windows boot and exit
+    #[arg(long)]
+    remove_autostart: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    // Handle autostart commands early (no config needed)
+    #[cfg(windows)]
+    {
+        if cli.install_autostart {
+            match autostart::install_autostart() {
+                Ok(()) => {
+                    eprintln!("Auto-start installed successfully.");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Failed to install auto-start: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        if cli.remove_autostart {
+            match autostart::remove_autostart() {
+                Ok(()) => {
+                    eprintln!("Auto-start removed successfully.");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Failed to remove auto-start: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 
     // Load config - try specified path first, then fall back to exe directory
     let config_path = if cli.config.exists() {
@@ -98,10 +142,11 @@ fn main() {
             let dp = data_path.clone();
             let en = exchange_names.clone();
 
+            let no_backfill = cli.no_backfill;
             let handle = std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new()
                     .expect("Failed to create tokio runtime");
-                rt.block_on(run_collector(cfg, dp, retention_days, health_interval, en, c, s));
+                rt.block_on(run_collector(cfg, dp, retention_days, health_interval, en, c, s, no_backfill));
             });
 
             // Tray blocks the main thread until Quit
@@ -113,6 +158,7 @@ fn main() {
 
     // Console mode
     info!("Starting in console mode");
+    let no_backfill = cli.no_backfill;
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(run_collector(
         cfg,
@@ -122,6 +168,7 @@ fn main() {
         exchange_names,
         counters,
         shutdown,
+        no_backfill,
     ));
 }
 
@@ -133,6 +180,7 @@ async fn run_collector(
     exchange_names: Vec<String>,
     counters: Arc<HealthCounters>,
     shutdown: Arc<AtomicBool>,
+    no_backfill: bool,
 ) {
     info!("Data path: {:?}", data_path);
     info!(
@@ -201,6 +249,20 @@ async fn run_collector(
         tokio::spawn(async move {
             server::start_server(server_cfg, server_broadcast, server_counters, server_data_path).await;
         });
+    }
+
+    // Run startup backfill (before starting live collectors)
+    if !no_backfill && cfg.backfill.enabled {
+        info!("Running startup backfill...");
+        backfill::run(
+            &cfg.exchanges,
+            &data_path,
+            &cfg.backfill,
+            &cfg.transformer.parquet_compression,
+        )
+        .await;
+    } else if no_backfill {
+        info!("Backfill: skipped (--no-backfill flag)");
     }
 
     // Spawn exchange collectors

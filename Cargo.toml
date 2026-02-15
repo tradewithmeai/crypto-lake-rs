@@ -44,6 +44,9 @@ axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["fs", "cors"] }
 tower = "0.4"
 
+# HTTP client (backfill REST API)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
 # Error handling
 anyhow = "1"
 

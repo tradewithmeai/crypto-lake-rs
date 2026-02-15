@@ -1,9 +1,18 @@
+use crate::autostart;
 use crate::health::HealthCounters;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
+
+fn autostart_label() -> String {
+    if autostart::is_autostart_enabled() {
+        "Start with Windows [ON]".to_string()
+    } else {
+        "Start with Windows [OFF]".to_string()
+    }
+}
 
 /// Run the system tray icon on the current thread.
 /// Blocks until the user clicks Quit.
@@ -19,6 +28,7 @@ pub fn run(
     let status_item = MenuItem::new("Starting...", false, None);
     let exchanges_text = format!("Exchanges: {}", exchanges.join(", "));
     let exchanges_item = MenuItem::new(&exchanges_text, false, None);
+    let autostart_item = MenuItem::new(&autostart_label(), true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
     let menu = Menu::new();
@@ -28,6 +38,7 @@ pub fn run(
     let _ = menu.append(&status_item);
     let _ = menu.append(&exchanges_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&autostart_item);
     let _ = menu.append(&quit_item);
 
     let icon = create_icon();
@@ -41,6 +52,7 @@ pub fn run(
 
     let quit_id = quit_item.id().clone();
     let dashboard_id = dashboard_item.id().clone();
+    let autostart_id = autostart_item.id().clone();
     let menu_rx = MenuEvent::receiver();
     let start = Instant::now();
     let mut last_update = Instant::now() - Duration::from_secs(10);
@@ -59,6 +71,13 @@ pub fn run(
                     let _ = std::process::Command::new("cmd")
                         .args(["/C", "start", "", &url])
                         .spawn();
+                } else if event.id == autostart_id {
+                    if autostart::is_autostart_enabled() {
+                        let _ = autostart::remove_autostart();
+                    } else {
+                        let _ = autostart::install_autostart();
+                    }
+                    let _ = autostart_item.set_text(&autostart_label());
                 }
             }
             Err(_) => {}

@@ -11,6 +11,8 @@ pub struct Config {
     pub transformer: Transformer,
     #[serde(default)]
     pub server: Server,
+    #[serde(default)]
+    pub backfill: Backfill,
 }
 
 #[allow(dead_code)]
@@ -69,6 +71,30 @@ pub struct Transformer {
     pub schedule_minutes: u64,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct Backfill {
+    #[serde(default = "default_backfill_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_gap_threshold_secs")]
+    pub gap_threshold_secs: u64,
+    #[serde(default = "default_max_backfill_secs")]
+    pub max_backfill_secs: u64,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for Backfill {
+    fn default() -> Self {
+        Self {
+            enabled: default_backfill_enabled(),
+            gap_threshold_secs: default_gap_threshold_secs(),
+            max_backfill_secs: default_max_backfill_secs(),
+            timeout_secs: default_timeout_secs(),
+        }
+    }
+}
+
 // ── Defaults ────────────────────────────────────────────────────────────────
 
 fn default_timezone() -> String { "UTC".into() }
@@ -84,6 +110,10 @@ fn default_parquet_compression() -> String { "zstd".into() }
 fn default_schedule_minutes() -> u64 { 60 }
 fn default_server_port() -> u16 { 8000 }
 fn default_static_dir() -> String { "./static".into() }
+fn default_backfill_enabled() -> bool { true }
+fn default_gap_threshold_secs() -> u64 { 60 }
+fn default_max_backfill_secs() -> u64 { 86400 }
+fn default_timeout_secs() -> u64 { 120 }
 
 impl Default for Server {
     fn default() -> Self {
