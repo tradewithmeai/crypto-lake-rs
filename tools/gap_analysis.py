@@ -3,7 +3,7 @@ Gap Analysis for Crypto Lake Parquet Data
 
 Scans all parquet files, identifies genuine gaps (missing seconds) in
 1-second bar coverage, distinguishes from no-trade bars (trade_count=0),
-classifies likely causes, and produces a detailed report.
+classifies likely causes, and produces a detailed report with source breakdown.
 """
 
 import duckdb
@@ -34,14 +34,35 @@ def main():
             symbol_dir = os.path.join(exchange_dir, symbol)
             glob_pattern = symbol_dir.replace("\\", "/") + "/**/*.parquet"
 
+            # Check if source column exists
             try:
-                result = con.execute(f"""
-                    SELECT
-                        epoch_us(window_start) / 1000000 as ts_sec,
-                        trade_count
-                    FROM read_parquet('{glob_pattern}', hive_partitioning=true)
-                    ORDER BY ts_sec
+                cols = con.execute(f"""
+                    SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet('{glob_pattern}', hive_partitioning=true))
                 """).fetchall()
+                col_names = [c[0] for c in cols]
+                has_source = "source" in col_names
+            except Exception:
+                has_source = False
+
+            try:
+                if has_source:
+                    result = con.execute(f"""
+                        SELECT
+                            epoch_us(window_start) / 1000000 as ts_sec,
+                            trade_count,
+                            source
+                        FROM read_parquet('{glob_pattern}', hive_partitioning=true)
+                        ORDER BY ts_sec
+                    """).fetchall()
+                else:
+                    result = con.execute(f"""
+                        SELECT
+                            epoch_us(window_start) / 1000000 as ts_sec,
+                            trade_count,
+                            'unknown' as source
+                        FROM read_parquet('{glob_pattern}', hive_partitioning=true)
+                        ORDER BY ts_sec
+                    """).fetchall()
             except Exception as e:
                 print(f"  Error reading {exchange}/{symbol}: {e}")
                 continue
@@ -51,12 +72,18 @@ def main():
 
             timestamps = [r[0] for r in result]
             trade_counts = [r[1] for r in result]
+            sources = [r[2] or "unknown" for r in result]
             first_ts = timestamps[0]
             last_ts = timestamps[-1]
             total_bars = len(timestamps)
             span_secs = last_ts - first_ts
             bars_with_trades = sum(1 for tc in trade_counts if tc > 0)
             no_trade_bars = total_bars - bars_with_trades
+
+            # Source breakdown
+            source_counts = {}
+            for s in sources:
+                source_counts[s] = source_counts.get(s, 0) + 1
 
             # Find genuine gaps (missing seconds, not just trade_count=0)
             gaps = []
@@ -99,6 +126,7 @@ def main():
                 "total_gap_secs": total_gap_secs,
                 "coverage": coverage,
                 "trade_pct": trade_pct,
+                "source_counts": source_counts,
             })
 
             print(f"  {exchange}/{symbol}: {len(gaps)} gaps, {coverage:.2f}% coverage, "
@@ -214,6 +242,12 @@ def generate_report(summaries, all_gaps, correlated):
         total_no_trade = sum(s["no_trade_bars"] for s in summaries)
         total_gaps = sum(s["gap_count"] for s in summaries)
 
+        # Aggregate source counts
+        agg_sources = {}
+        for s in summaries:
+            for src, cnt in s["source_counts"].items():
+                agg_sources[src] = agg_sources.get(src, 0) + cnt
+
         lines.append(f"- **Collection period**: {first_data.strftime('%Y-%m-%d %H:%M')} to {last_data.strftime('%Y-%m-%d %H:%M')} UTC")
         lines.append(f"- **Total span**: {fmt_duration(int((last_data - first_data).total_seconds()))}")
         lines.append(f"- **Total 1s bars**: {total_bars:,}")
@@ -224,17 +258,35 @@ def generate_report(summaries, all_gaps, correlated):
         lines.append(f"- **Symbols**: {len(summaries)}")
         lines.append("")
 
+        # Source breakdown
+        lines.append("### Data Source Breakdown\n")
+        lines.append("| Source | Bars | Percentage |")
+        lines.append("|--------|------|-----------|")
+        for src in sorted(agg_sources.keys()):
+            cnt = agg_sources[src]
+            pct = cnt / total_bars * 100
+            lines.append(f"| {src} | {cnt:,} | {pct:.1f}% |")
+        lines.append("")
+
     # Coverage by Symbol
     lines.append("## Coverage by Symbol\n")
-    lines.append("| Exchange | Symbol | First Bar | Last Bar | Total Bars | With Trades | No-Trade | Gaps | Gap Time | Coverage |")
-    lines.append("|----------|--------|-----------|----------|------------|-------------|----------|------|----------|----------|")
+    lines.append("| Exchange | Symbol | First Bar | Last Bar | Total Bars | With Trades | No-Trade | Gaps | Gap Time | Coverage | Sources |")
+    lines.append("|----------|--------|-----------|----------|------------|-------------|----------|------|----------|----------|---------|")
     for s in sorted(summaries, key=lambda x: (x["exchange"], x["symbol"])):
+        # Compact source summary
+        src_parts = []
+        for src in sorted(s["source_counts"].keys()):
+            cnt = s["source_counts"][src]
+            src_parts.append(f"{src}:{cnt:,}")
+        src_str = " ".join(src_parts)
+
         lines.append(
             f"| {s['exchange']} | {s['symbol']} | {s['first'].strftime('%m-%d %H:%M')} "
             f"| {s['last'].strftime('%m-%d %H:%M')} | {s['total_bars']:,} "
             f"| {s['bars_with_trades']:,} | {s['no_trade_bars']:,} "
             f"| {s['gap_count']} "
-            f"| {fmt_duration(int(s['total_gap_secs']))} | {s['coverage']:.2f}% |"
+            f"| {fmt_duration(int(s['total_gap_secs']))} | {s['coverage']:.2f}% "
+            f"| {src_str} |"
         )
     lines.append("")
 
@@ -310,7 +362,7 @@ def generate_report(summaries, all_gaps, correlated):
         rec_num += 1
 
     if has_app_restart:
-        lines.append(f"{rec_num}. **Investigate app crashes** -- Check Windows Event Viewer and app logs for crash reports during extended outage periods.")
+        lines.append(f"{rec_num}. **Investigate app crashes** -- Check `crash.log` next to the executable for panic traces. Also check Windows Event Viewer for crash reports.")
         rec_num += 1
 
     if has_network:

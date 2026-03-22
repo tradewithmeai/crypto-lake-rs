@@ -24,6 +24,8 @@ pub struct Bar1s {
     pub bid: f64,
     pub ask: f64,
     pub spread: f64,
+    /// Data source: "live", "empty", "backfill_1s", "backfill_1m"
+    pub source: String,
 }
 
 /// Accumulator for a single 1-second bar.
@@ -92,6 +94,7 @@ impl BarAccumulator {
             bid: 0.0,
             ask: 0.0,
             spread: 0.0,
+            source: "live".to_string(),
         }
     }
 }
@@ -129,7 +132,13 @@ pub fn spawn_aggregator(
         loop {
             tokio::select! {
                 Some(trade) = trade_rx.recv() => {
-                    let second_ts = trade.timestamp_ms / 1000;
+                    // Use wall-clock receive time, not Binance trade time.
+                    // On poor mobile connections, Binance messages can arrive with
+                    // timestamps minutes in the past (TCP buffer delay). Using trade
+                    // time would cause last_emitted to advance past the trade's second,
+                    // silently discarding it. Receive time guarantees the trade always
+                    // lands in a current bucket. Raw JSONL files preserve original timestamps.
+                    let second_ts = chrono::Utc::now().timestamp();
                     let sym_key = (trade.exchange.clone(), trade.symbol.clone());
 
                     // Initialize tracking on first trade for this symbol
@@ -179,6 +188,7 @@ pub fn spawn_aggregator(
                                     bid: 0.0,
                                     ask: 0.0,
                                     spread: 0.0,
+                                    source: "empty".to_string(),
                                 }
                             };
 
