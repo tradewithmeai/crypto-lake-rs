@@ -62,4 +62,4 @@ backfill:
   enabled: true
   gap_threshold_secs: 60      # minimum gap to trigger backfill
   max_backfill_secs: 86400    # max 24 hours of backfill
-  timeout_secs: 120           # abort backfill if no network
+  timeout_secs: 300           # abort backfill if no network

@@ -58,6 +58,48 @@ struct Cli {
 }
 
 fn main() {
+    // Install panic hook to write crashes to a log file for post-mortem analysis
+    std::panic::set_hook(Box::new(|info| {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        let crash_msg = format!(
+            "[{}] PANIC in thread '{}'\n  Location: {}\n  Message: {}\n  Backtrace:\n{}\n\n",
+            timestamp, thread_name, location, payload, backtrace
+        );
+
+        // Try to write to crash.log next to the executable
+        let crash_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("crash.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("crash.log"));
+
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&crash_path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(crash_msg.as_bytes())
+            });
+
+        // Also print to stderr
+        eprintln!("{}", crash_msg);
+    }));
+
     let cli = Cli::parse();
 
     // Handle autostart commands early (no config needed)

@@ -10,64 +10,205 @@
     <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
     <link rel="manifest" href="/static/site.webmanifest">
-    <meta name="theme-color" content="#131722">
+    <meta name="theme-color" content="#07090e">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/dashboard.css">
 </head>
 <body>
-    <!-- Auth overlay -->
-    <div id="auth-overlay" class="auth-overlay" style="display: none;">
-        <div class="auth-card">
-            <h2 class="auth-title">Crypto Lake</h2>
-            <div id="google-signin-container" style="display: none;">
-                <div id="google-signin-btn"></div>
-                <div class="auth-divider"><span>or</span></div>
+    <div class="app">
+
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                        <rect x="1" y="1" width="8" height="8" rx="1.5" fill="#e8a020"/>
+                        <rect x="11" y="1" width="8" height="8" rx="1.5" fill="#e8a020" opacity="0.5"/>
+                        <rect x="1" y="11" width="8" height="8" rx="1.5" fill="#e8a020" opacity="0.3"/>
+                        <rect x="11" y="11" width="8" height="8" rx="1.5" fill="#e8a020" opacity="0.7"/>
+                    </svg>
+                    <span>CRYPTO LAKE</span>
+                </div>
             </div>
-            <div class="auth-tabs">
-                <button class="auth-tab active" data-tab="login">Login</button>
-                <button class="auth-tab" data-tab="register">Register</button>
+
+            <nav class="sidebar-nav">
+                <button class="nav-btn active" data-tab="chart">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                        <polyline points="1,12 5,7 9,9 15,3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    Chart
+                </button>
+                <button class="nav-btn" data-tab="lake">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                        <rect x="1" y="10" width="4" height="5" rx="0.5" stroke="currentColor" stroke-width="1.5"/>
+                        <rect x="6" y="6" width="4" height="9" rx="0.5" stroke="currentColor" stroke-width="1.5"/>
+                        <rect x="11" y="2" width="4" height="13" rx="0.5" stroke="currentColor" stroke-width="1.5"/>
+                    </svg>
+                    Data Lake
+                </button>
+                <button class="nav-btn" data-tab="system">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                        <circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.5"/>
+                        <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.41 1.41M11.54 11.54l1.41 1.41M3.05 12.95l1.41-1.41M11.54 4.46l1.41-1.41" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                    </svg>
+                    System
+                </button>
+            </nav>
+
+            <div class="sidebar-section-label">MARKETS</div>
+
+            <div class="exchange-group" id="exchange-binance">
+                <div class="exchange-header" data-exchange="binance">
+                    <span class="exchange-dot"></span>
+                    <span class="exchange-name">Binance</span>
+                    <svg class="exchange-chevron" width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <polyline points="2,3 5,7 8,3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <div class="symbol-list" id="symbol-list-binance"></div>
             </div>
-            <form id="login-form" class="auth-form">
-                <input type="text" id="login-username" placeholder="Username" required autocomplete="username">
-                <input type="password" id="login-password" placeholder="Password" required autocomplete="current-password">
-                <button type="submit" class="auth-submit">Login</button>
-                <div id="login-error" class="auth-error"></div>
-            </form>
-            <form id="register-form" class="auth-form" style="display: none;">
-                <input type="text" id="reg-username" placeholder="Username" required autocomplete="username">
-                <input type="email" id="reg-email" placeholder="Email" required autocomplete="email">
-                <input type="password" id="reg-password" placeholder="Password (min 8 chars)" required autocomplete="new-password">
-                <button type="submit" class="auth-submit">Register</button>
-                <div id="register-error" class="auth-error"></div>
-            </form>
+
+            <div class="exchange-group" id="exchange-coinbase">
+                <div class="exchange-header" data-exchange="coinbase">
+                    <span class="exchange-dot"></span>
+                    <span class="exchange-name">Coinbase</span>
+                    <svg class="exchange-chevron" width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <polyline points="2,3 5,7 8,3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <div class="symbol-list" id="symbol-list-coinbase"></div>
+            </div>
+
+            <div class="exchange-group" id="exchange-kraken">
+                <div class="exchange-header" data-exchange="kraken">
+                    <span class="exchange-dot"></span>
+                    <span class="exchange-name">Kraken</span>
+                    <svg class="exchange-chevron" width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <polyline points="2,3 5,7 8,3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <div class="symbol-list" id="symbol-list-kraken"></div>
+            </div>
+        </aside>
+
+        <!-- Main content -->
+        <div class="main">
+
+            <!-- Top bar -->
+            <header class="topbar">
+                <div class="topbar-left">
+                    <span class="current-symbol-label" id="symbol-label">--</span>
+                    <span class="current-exchange-label" id="exchange-label">--</span>
+                </div>
+                <div class="topbar-center" id="tf-controls">
+                    <div class="tf-group">
+                        <button class="tf-btn" data-tf="1s">1s</button>
+                        <button class="tf-btn" data-tf="1m">1m</button>
+                        <button class="tf-btn active" data-tf="5m">5m</button>
+                        <button class="tf-btn" data-tf="15m">15m</button>
+                        <button class="tf-btn" data-tf="1h">1h</button>
+                    </div>
+                </div>
+                <div class="topbar-right">
+                    <div class="price-block" id="price-block">
+                        <span class="live-price" id="live-price">--</span>
+                        <span class="price-change" id="price-change"></span>
+                    </div>
+                    <div class="status-block">
+                        <span class="ws-dot" id="ws-dot" title="Live feed"></span>
+                        <span class="ws-label" id="ws-label">connecting</span>
+                    </div>
+                    <span class="gap-badge" id="gap-badge" style="display:none"></span>
+                </div>
+            </header>
+
+            <!-- Tab panels -->
+            <div class="tab-panel active" id="tab-chart">
+                <div id="chart-container">
+                    <div class="panel-loading">Loading chart data...</div>
+                </div>
+            </div>
+
+            <div class="tab-panel" id="tab-lake">
+                <div class="lake-container">
+                    <div class="lake-header">
+                        <div class="lake-title">
+                            <h2>Data Lake</h2>
+                            <span class="lake-subtitle">Parquet archive quality metrics</span>
+                        </div>
+                        <button class="refresh-btn" id="lake-refresh">
+                            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                                <path d="M12 2.5A6 6 0 1 1 2 7h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                                <polyline points="0,5 2,7 4,5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            Refresh
+                        </button>
+                    </div>
+                    <div class="lake-summary-bar" id="lake-summary-bar"></div>
+                    <div class="lake-table-wrap">
+                        <table class="lake-table" id="lake-table">
+                            <thead>
+                                <tr>
+                                    <th data-sort="symbol">Symbol <span class="sort-icon">↕</span></th>
+                                    <th data-sort="exchange">Exchange <span class="sort-icon">↕</span></th>
+                                    <th data-sort="live_pct" class="num-col">Live % <span class="sort-icon">↕</span></th>
+                                    <th class="num-col bar-col">Quality</th>
+                                    <th data-sort="total_bars" class="num-col">Total Bars <span class="sort-icon">↕</span></th>
+                                    <th data-sort="total_trades" class="num-col">Trades <span class="sort-icon">↕</span></th>
+                                    <th data-sort="data_hours" class="num-col">Span <span class="sort-icon">↕</span></th>
+                                    <th data-sort="last_close" class="num-col">Last Price <span class="sort-icon">↕</span></th>
+                                    <th class="num-col">Updated</th>
+                                </tr>
+                            </thead>
+                            <tbody id="lake-table-body">
+                                <tr><td colspan="9" class="table-loading">Loading analysis data...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="tab-panel" id="tab-system">
+                <div class="system-container">
+                    <div class="system-grid">
+                        <div class="system-card">
+                            <div class="card-label">COLLECTOR STATS</div>
+                            <div class="stat-grid" id="stats-grid">
+                                <div class="stat-row"><span class="stat-label">Messages received</span><span class="stat-value mono" id="stat-messages">--</span></div>
+                                <div class="stat-row"><span class="stat-label">Trades received</span><span class="stat-value mono" id="stat-trades">--</span></div>
+                                <div class="stat-row"><span class="stat-label">Bars produced</span><span class="stat-value mono" id="stat-bars">--</span></div>
+                                <div class="stat-row"><span class="stat-label">WS disconnects</span><span class="stat-value mono" id="stat-disconnects">--</span></div>
+                                <div class="stat-row"><span class="stat-label">WS reconnects</span><span class="stat-value mono" id="stat-reconnects">--</span></div>
+                            </div>
+                        </div>
+
+                        <div class="system-card">
+                            <div class="card-label">LIVE FEED</div>
+                            <div class="feed-status">
+                                <div class="feed-indicator" id="feed-indicator">
+                                    <div class="feed-dot"></div>
+                                    <span id="feed-status-text">Connecting to live feed...</span>
+                                </div>
+                                <div class="trade-ticker" id="trade-ticker">
+                                    <div class="ticker-label">Recent trades</div>
+                                    <div class="ticker-rows" id="ticker-rows"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="system-card wide-card">
+                            <div class="card-label">EXCHANGE CONNECTIONS</div>
+                            <div class="exchange-status-list" id="exchange-status-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
         </div>
     </div>
 
-    <header>
-        <span class="logo">Crypto Lake</span>
-        <div class="controls">
-            <select id="exchange-select"></select>
-            <select id="symbol-select"></select>
-            <div class="tf-buttons">
-                <button class="tf-btn" data-tf="1m">1m</button>
-                <button class="tf-btn active" data-tf="5m">5m</button>
-                <button class="tf-btn" data-tf="15m">15m</button>
-                <button class="tf-btn" data-tf="1h">1h</button>
-            </div>
-            <div class="price-display">
-                <span id="live-price">--</span>
-                <span id="price-change">--</span>
-                <span class="status-dot" id="ws-status" title="WebSocket status"></span>
-                <span id="gap-indicator" class="gap-indicator" style="display: none;" title="Data gaps detected"></span>
-            </div>
-            <div class="user-menu" id="user-menu" style="display: none;">
-                <span id="username-display"></span>
-                <button id="logout-btn" class="logout-btn">Logout</button>
-            </div>
-        </div>
-    </header>
-    <div id="chart-container">
-        <div class="loading">Loading chart data...</div>
-    </div>
     <script src="/static/js/lightweight-charts.standalone.production.js"></script>
     <script src="/static/js/dashboard.js"></script>
 </body>

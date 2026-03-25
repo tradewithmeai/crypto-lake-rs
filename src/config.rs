@@ -113,7 +113,7 @@ fn default_static_dir() -> String { "./static".into() }
 fn default_backfill_enabled() -> bool { true }
 fn default_gap_threshold_secs() -> u64 { 60 }
 fn default_max_backfill_secs() -> u64 { 86400 }
-fn default_timeout_secs() -> u64 { 120 }
+fn default_timeout_secs() -> u64 { 300 }
 
 impl Default for Server {
     fn default() -> Self {

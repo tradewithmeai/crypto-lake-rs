@@ -29,6 +29,7 @@ pub fn bars_schema() -> Schema {
         Field::new("bid", DataType::Float64, true),
         Field::new("ask", DataType::Float64, true),
         Field::new("spread", DataType::Float64, true),
+        Field::new("source", DataType::Utf8, false),
     ])
 }
 
@@ -173,6 +174,7 @@ pub fn write_parquet_file(
     let bid: Vec<f64> = bars.iter().map(|b| b.bid).collect();
     let ask: Vec<f64> = bars.iter().map(|b| b.ask).collect();
     let spread: Vec<f64> = bars.iter().map(|b| b.spread).collect();
+    let source: Vec<&str> = bars.iter().map(|b| b.source.as_str()).collect();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -191,6 +193,7 @@ pub fn write_parquet_file(
             Arc::new(Float64Array::from(bid)),
             Arc::new(Float64Array::from(ask)),
             Arc::new(Float64Array::from(spread)),
+            Arc::new(StringArray::from(source)),
         ],
     )?;
 

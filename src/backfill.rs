@@ -41,86 +41,112 @@ async fn run_inner(
     backfill_cfg: &Backfill,
     compression: &str,
 ) {
+    // Run all exchanges in parallel
+    let mut handles = Vec::new();
+    for exchange in exchanges {
+        let exchange = exchange.clone();
+        let data_path = data_path.to_path_buf();
+        let gap_threshold = backfill_cfg.gap_threshold_secs;
+        let max_backfill = backfill_cfg.max_backfill_secs;
+        let compression = compression.to_string();
+
+        handles.push(tokio::spawn(async move {
+            backfill_exchange(&exchange, &data_path, gap_threshold, max_backfill, &compression).await;
+        }));
+    }
+
+    // Wait for all exchanges to complete
+    for handle in handles {
+        let _ = handle.await;
+    }
+}
+
+/// Backfill a single exchange (all its symbols sequentially with rate limiting).
+async fn backfill_exchange(
+    exchange: &Exchange,
+    data_path: &Path,
+    gap_threshold: u64,
+    max_backfill: u64,
+    compression: &str,
+) {
+    let exchange_name = &exchange.name;
+    let rest_url = &exchange.rest_url;
+
+    if rest_url.is_empty() {
+        info!("Backfill: [{}] no REST URL configured, skipping", exchange_name);
+        return;
+    }
+
     let now = Utc::now().timestamp();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap();
 
-    for exchange in exchanges {
-        let exchange_name = &exchange.name;
-        let rest_url = &exchange.rest_url;
+    for symbol in &exchange.symbols {
+        // Determine the filesystem-safe symbol (matches collector logic)
+        let safe_symbol = match exchange_name.as_str() {
+            "kraken" => symbol.replace('/', "-"),
+            _ => symbol.clone(),
+        };
 
-        if rest_url.is_empty() {
-            info!("Backfill: [{}] no REST URL configured, skipping", exchange_name);
+        let last_ts = scan_latest_timestamp(data_path, exchange_name, &safe_symbol).await;
+
+        let gap_secs = match last_ts {
+            Some(ts) => now - ts,
+            None => {
+                info!("Backfill: [{}] {} — no existing data, skipping", exchange_name, symbol);
+                continue;
+            }
+        };
+
+        if gap_secs < gap_threshold as i64 {
+            info!(
+                "Backfill: [{}] {} — gap {}s < threshold {}s, skipping",
+                exchange_name, symbol, gap_secs, gap_threshold
+            );
             continue;
         }
 
-        for symbol in &exchange.symbols {
-            // Determine the filesystem-safe symbol (matches collector logic)
-            let safe_symbol = match exchange_name.as_str() {
-                "kraken" => symbol.replace('/', "-"),
-                _ => symbol.clone(),
-            };
+        let start_ts = last_ts.unwrap();
+        let max_end = start_ts + max_backfill as i64;
+        let end_ts = now.min(max_end);
 
-            let last_ts = scan_latest_timestamp(data_path, exchange_name, &safe_symbol).await;
+        info!(
+            "Backfill: [{}] {} — gap {}s, fetching from {} to {}",
+            exchange_name, symbol, gap_secs, start_ts, end_ts
+        );
 
-            let gap_secs = match last_ts {
-                Some(ts) => now - ts,
-                None => {
-                    info!("Backfill: [{}] {} — no existing data, skipping", exchange_name, symbol);
-                    continue;
-                }
-            };
-
-            if gap_secs < backfill_cfg.gap_threshold_secs as i64 {
-                info!(
-                    "Backfill: [{}] {} — gap {}s < threshold {}s, skipping",
-                    exchange_name, symbol, gap_secs, backfill_cfg.gap_threshold_secs
-                );
+        let bars = match exchange_name.as_str() {
+            "binance" => fetch_binance(&client, rest_url, symbol, start_ts, end_ts).await,
+            "coinbase" => fetch_coinbase(&client, rest_url, symbol, start_ts, end_ts).await,
+            "kraken" => fetch_kraken(&client, rest_url, symbol, start_ts, end_ts).await,
+            other => {
+                warn!("Backfill: unknown exchange '{}', skipping", other);
                 continue;
             }
+        };
 
-            let start_ts = last_ts.unwrap();
-            let max_end = start_ts + backfill_cfg.max_backfill_secs as i64;
-            let end_ts = now.min(max_end);
-
-            info!(
-                "Backfill: [{}] {} — gap {}s, fetching from {} to {}",
-                exchange_name, symbol, gap_secs, start_ts, end_ts
-            );
-
-            let bars = match exchange_name.as_str() {
-                "binance" => fetch_binance(&client, rest_url, symbol, start_ts, end_ts).await,
-                "coinbase" => fetch_coinbase(&client, rest_url, symbol, start_ts, end_ts).await,
-                "kraken" => fetch_kraken(&client, rest_url, symbol, start_ts, end_ts).await,
-                other => {
-                    warn!("Backfill: unknown exchange '{}', skipping", other);
-                    continue;
-                }
-            };
-
-            match bars {
-                Ok(bars) if !bars.is_empty() => {
-                    info!(
-                        "Backfill: [{}] {} — fetched {} bars",
-                        exchange_name, symbol, bars.len()
-                    );
-                    if let Err(e) = parquet_writer::write_bars(&bars, data_path, compression).await {
-                        warn!("Backfill: [{}] {} — write error: {}", exchange_name, symbol, e);
-                    }
-                }
-                Ok(_) => {
-                    info!("Backfill: [{}] {} — no bars returned", exchange_name, symbol);
-                }
-                Err(e) => {
-                    warn!("Backfill: [{}] {} — fetch error: {}", exchange_name, symbol, e);
+        match bars {
+            Ok(bars) if !bars.is_empty() => {
+                info!(
+                    "Backfill: [{}] {} — fetched {} bars",
+                    exchange_name, symbol, bars.len()
+                );
+                if let Err(e) = parquet_writer::write_bars(&bars, data_path, compression).await {
+                    warn!("Backfill: [{}] {} — write error: {}", exchange_name, symbol, e);
                 }
             }
-
-            // Rate limiting between requests
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(_) => {
+                info!("Backfill: [{}] {} — no bars returned", exchange_name, symbol);
+            }
+            Err(e) => {
+                warn!("Backfill: [{}] {} — fetch error: {}", exchange_name, symbol, e);
+            }
         }
+
+        // Rate limiting between requests
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -286,6 +312,7 @@ async fn fetch_binance(
                 bid: 0.0,
                 ask: 0.0,
                 spread: 0.0,
+                source: "backfill_1s".to_string(),
             });
 
             last_open_time = open_time_ms;
@@ -364,6 +391,7 @@ async fn fetch_coinbase(
                 bid: 0.0,
                 ask: 0.0,
                 spread: 0.0,
+                source: "backfill_1m".to_string(),
             });
         }
 
@@ -470,6 +498,7 @@ async fn fetch_kraken(
                     bid: 0.0,
                     ask: 0.0,
                     spread: 0.0,
+                    source: "backfill_1m".to_string(),
                 });
 
                 cursor = ts;

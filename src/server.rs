@@ -67,6 +67,7 @@ pub async fn start_server(
         .route("/api/v1/symbols", get(symbols_handler))
         .route("/api/v1/bars/:symbol/latest", get(bars_handler))
         .route("/api/v1/health", get(health_handler))
+        .route("/api/v1/analysis/summary", get(analysis_summary_handler))
         .route("/api/v1/ws/stream", get(ws_handler))
         .nest_service("/static", ServeDir::new(&static_dir))
         .layer(CorsLayer::permissive())
@@ -291,6 +292,150 @@ async fn collect_parquet_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+// ── Analysis endpoint ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SymbolSummary {
+    exchange: String,
+    symbol: String,
+    total_bars: u64,
+    live_bars: u64,
+    empty_bars: u64,
+    total_trades: u64,
+    live_pct: f64,
+    earliest_ts: String,
+    latest_ts: String,
+    last_close: f64,
+    data_hours: f64,
+}
+
+// GET /api/v1/analysis/summary
+async fn analysis_summary_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let parquet_base = state.data_path.join("parquet");
+    let mut summaries: Vec<SymbolSummary> = Vec::new();
+
+    if let Ok(mut exchanges) = tokio::fs::read_dir(&parquet_base).await {
+        while let Ok(Some(ex_entry)) = exchanges.next_entry().await {
+            if !ex_entry.path().is_dir() { continue; }
+            let exchange_name = ex_entry.file_name().to_string_lossy().to_string();
+
+            if let Ok(mut symbols) = tokio::fs::read_dir(ex_entry.path()).await {
+                while let Ok(Some(sym_entry)) = symbols.next_entry().await {
+                    if !sym_entry.path().is_dir() { continue; }
+                    let symbol_name = sym_entry.file_name().to_string_lossy().to_string();
+
+                    let mut parquet_files: Vec<PathBuf> = Vec::new();
+                    collect_parquet_files(&sym_entry.path(), &mut parquet_files).await;
+
+                    if parquet_files.is_empty() { continue; }
+
+                    if let Ok(summary) = compute_symbol_summary(&exchange_name, &symbol_name, &parquet_files).await {
+                        summaries.push(summary);
+                    }
+                }
+            }
+        }
+    }
+
+    summaries.sort_by(|a, b| a.exchange.cmp(&b.exchange).then(a.symbol.cmp(&b.symbol)));
+    Json(serde_json::json!({ "symbols": summaries }))
+}
+
+async fn compute_symbol_summary(
+    exchange: &str,
+    symbol: &str,
+    files: &[PathBuf],
+) -> Result<SymbolSummary, Box<dyn std::error::Error + Send + Sync>> {
+    let files = files.to_vec();
+    let exchange = exchange.to_string();
+    let symbol = symbol.to_string();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<SymbolSummary, Box<dyn std::error::Error + Send + Sync>> {
+        use arrow::array::{Float64Array, StringArray, TimestampMicrosecondArray, UInt64Array};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let mut total_bars: u64 = 0;
+        let mut live_bars: u64 = 0;
+        let mut empty_bars: u64 = 0;
+        let mut total_trades: u64 = 0;
+        let mut earliest_us: Option<i64> = None;
+        let mut latest_us: Option<i64> = None;
+        let mut last_close: f64 = 0.0;
+
+        for file_path in &files {
+            let file = match std::fs::File::open(file_path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let reader = match ParquetRecordBatchReaderBuilder::try_new(file).and_then(|b| b.build()) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            for batch in reader {
+                let batch = match batch { Ok(b) => b, Err(_) => continue };
+                let n = batch.num_rows();
+                // Schema: col 0=window_start, 6=close, 9=trade_count, 14=source
+                let ts_col = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>();
+                let close_col = batch.column(6).as_any().downcast_ref::<Float64Array>();
+                let count_col = batch.column(9).as_any().downcast_ref::<UInt64Array>();
+                let source_col = batch.column(14).as_any().downcast_ref::<StringArray>();
+
+                if let (Some(ts), Some(close), Some(cnt), Some(src)) =
+                    (ts_col, close_col, count_col, source_col)
+                {
+                    for i in 0..n {
+                        let ts_us = ts.value(i);
+                        let count = cnt.value(i);
+                        let src_val = src.value(i);
+                        let close_val = close.value(i);
+
+                        total_bars += 1;
+                        total_trades += count;
+                        if src_val == "live" { live_bars += 1; }
+                        if count == 0 { empty_bars += 1; }
+
+                        match earliest_us {
+                            None => earliest_us = Some(ts_us),
+                            Some(e) if ts_us < e => earliest_us = Some(ts_us),
+                            _ => {}
+                        }
+                        match latest_us {
+                            None => { latest_us = Some(ts_us); last_close = close_val; }
+                            Some(l) if ts_us > l => { latest_us = Some(ts_us); last_close = close_val; }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let live_pct = if total_bars > 0 { live_bars as f64 / total_bars as f64 * 100.0 } else { 0.0 };
+
+        let fmt_ts = |us: i64| {
+            chrono::DateTime::from_timestamp(us / 1_000_000, 0)
+                .unwrap_or_default()
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        };
+
+        let earliest_ts = earliest_us.map(fmt_ts).unwrap_or_default();
+        let latest_ts = latest_us.map(fmt_ts).unwrap_or_default();
+
+        let data_hours = match (earliest_us, latest_us) {
+            (Some(e), Some(l)) => (l - e) as f64 / 1_000_000.0 / 3600.0,
+            _ => 0.0,
+        };
+
+        Ok(SymbolSummary {
+            exchange, symbol, total_bars, live_bars, empty_bars, total_trades,
+            live_pct, earliest_ts, latest_ts, last_close, data_hours,
+        })
+    }).await??;
+
+    Ok(result)
 }
 
 // ── WebSocket handler ───────────────────────────────────────────────────────
