@@ -28,6 +28,14 @@ const state = {
     tickerTrades: [],
     healthPollInterval: null,
     lakePollInterval: null,
+
+    // Indicators
+    bars: [],            // processed bars from last fetch: [{time, open, high, low, close, volume, vwap}]
+    indicators: { bb: false, sma20: false, sma50: false, sma200: false, ema12: false, ema26: false, vwap: false, rsi: false },
+    indSeries: {},       // name -> LWC series (or {upper,middle,lower} for BB)
+    rsiChart: null,
+    rsiSeries: null,
+    rsiSyncBusy: false,
 };
 
 const TF_SEC = { '1s': 1, '1m': 60, '5m': 300, '15m': 900, '1h': 3600 };
@@ -37,6 +45,7 @@ const TF_SEC = { '1s': 1, '1m': 60, '5m': 300, '15m': 900, '1h': 3600 };
 document.addEventListener('DOMContentLoaded', async () => {
     setupNavigation();
     setupTfButtons();
+    setupIndicatorToolbar();
     await loadSymbols();
     createChart();
     await loadChartData();
@@ -231,11 +240,27 @@ function createChart() {
         scaleMargins: { top: 0.8, bottom: 0 },
     });
 
+    // Crosshair legend
+    state.chart.subscribeCrosshairMove(param => {
+        if (!param.time || !param.point) { clearLegend(); return; }
+        const bar = param.seriesData.get(state.candleSeries);
+        if (!bar) { clearLegend(); return; }
+        updateLegend(param.time, bar, param);
+    });
+
     window.addEventListener('resize', () => {
-        state.chart.applyOptions({
-            width: container.clientWidth,
-            height: container.clientHeight,
-        });
+        const w = container.clientWidth;
+        const h = container.clientHeight;
+        state.chart.applyOptions({ width: w, height: h });
+        if (state.rsiChart) {
+            state.rsiChart.applyOptions({ width: document.getElementById('rsi-container').clientWidth });
+        }
+    });
+
+    // Reset zoom button
+    document.getElementById('reset-zoom').addEventListener('click', () => {
+        state.chart.timeScale().fitContent();
+        if (state.rsiChart) state.rsiChart.timeScale().fitContent();
     });
 }
 
@@ -254,19 +279,23 @@ async function loadChartData() {
 
         const bars = data.data.reverse(); // API returns newest first
 
-        const candles = bars.map(b => ({
+        // Build processed bars with all fields needed for indicators
+        const processed = bars.map(b => ({
             time: Math.floor(new Date(b.ts).getTime() / 1000),
             open: b.open, high: b.high, low: b.low, close: b.close,
+            volume: b.volume_base || 0,
+            vwap: b.vwap || b.close,
         }));
+        state.bars = processed;
 
-        const volumes = bars.map(b => ({
-            time: Math.floor(new Date(b.ts).getTime() / 1000),
-            value: b.volume_base || 0,
+        state.candleSeries.setData(processed.map(b => ({
+            time: b.time, open: b.open, high: b.high, low: b.low, close: b.close,
+        })));
+        state.volumeSeries.setData(processed.map(b => ({
+            time: b.time,
+            value: b.volume,
             color: b.close >= b.open ? 'rgba(52,211,153,0.25)' : 'rgba(248,113,113,0.25)',
-        }));
-
-        state.candleSeries.setData(candles);
-        state.volumeSeries.setData(volumes);
+        })));
 
         // Gap markers
         const expected = TF_SEC[state.tf] || 300;
@@ -302,7 +331,9 @@ async function loadChartData() {
         state.currentCandleTime = null;
         state.currentVolume = 0;
 
+        renderIndicators(state.bars);
         state.chart.timeScale().fitContent();
+        if (state.rsiChart) state.rsiChart.timeScale().fitContent();
     } catch (err) {
         console.error('Chart load failed:', err);
     }
@@ -435,6 +466,15 @@ function updateChart(trade) {
         color: state.currentCandle.close >= state.currentCandle.open
             ? 'rgba(52,211,153,0.25)' : 'rgba(248,113,113,0.25)',
     });
+
+    // Keep state.bars in sync with live candle (update or append last bar)
+    const liveBar = { ...state.currentCandle, volume: state.currentVolume, vwap: state.currentCandle.close };
+    if (state.bars.length > 0 && state.bars[state.bars.length - 1].time === candleStart) {
+        state.bars[state.bars.length - 1] = liveBar;
+    } else if (state.bars.length === 0 || candleStart > state.bars[state.bars.length - 1].time) {
+        state.bars.push(liveBar);
+    }
+    updateLiveIndicators(liveBar);
 }
 
 // ── Trade ticker (system tab) ─────────────────────────────────────────────
@@ -674,4 +714,357 @@ function fmtTime(isoStr) {
 
 function cap(str) {
     return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+// ── Indicator toolbar ──────────────────────────────────────────────────────
+
+function setupIndicatorToolbar() {
+    document.querySelectorAll('.ind-btn').forEach(btn => {
+        btn.addEventListener('click', () => toggleIndicator(btn.dataset.ind));
+    });
+}
+
+function toggleIndicator(name) {
+    state.indicators[name] = !state.indicators[name];
+    document.querySelectorAll(`.ind-btn[data-ind="${name}"]`).forEach(btn => {
+        btn.classList.toggle('active', state.indicators[name]);
+    });
+
+    if (!state.indicators[name]) {
+        removeIndicatorSeries(name);
+        if (name === 'rsi') {
+            document.getElementById('rsi-container').classList.remove('visible');
+        }
+    } else {
+        renderIndicators(state.bars);
+    }
+}
+
+function removeIndicatorSeries(name) {
+    const s = state.indSeries[name];
+    if (!s) return;
+    if (name === 'bb') {
+        try { state.chart.removeSeries(s.upper); } catch {}
+        try { state.chart.removeSeries(s.middle); } catch {}
+        try { state.chart.removeSeries(s.lower); } catch {}
+    } else {
+        try { state.chart.removeSeries(s); } catch {}
+    }
+    delete state.indSeries[name];
+}
+
+// ── Indicator math ──────────────────────────────────────────────────────────
+
+function calcSMA(values, period) {
+    const result = new Array(values.length).fill(null);
+    let sum = 0;
+    for (let i = 0; i < values.length; i++) {
+        sum += values[i];
+        if (i >= period) sum -= values[i - period];
+        if (i >= period - 1) result[i] = sum / period;
+    }
+    return result;
+}
+
+function calcEMA(values, period) {
+    const result = new Array(values.length).fill(null);
+    const alpha = 2 / (period + 1);
+    let ema = null;
+    for (let i = 0; i < values.length; i++) {
+        if (ema === null) {
+            // Seed with SMA of first `period` values
+            if (i === period - 1) {
+                let sum = 0;
+                for (let j = 0; j < period; j++) sum += values[j];
+                ema = sum / period;
+                result[i] = ema;
+            }
+        } else {
+            ema = alpha * values[i] + (1 - alpha) * ema;
+            result[i] = ema;
+        }
+    }
+    return result;
+}
+
+function calcBB(values, period = 20, mult = 2) {
+    const middle = calcSMA(values, period);
+    const upper = new Array(values.length).fill(null);
+    const lower = new Array(values.length).fill(null);
+    for (let i = period - 1; i < values.length; i++) {
+        let variance = 0;
+        for (let j = i - period + 1; j <= i; j++) {
+            const diff = values[j] - middle[i];
+            variance += diff * diff;
+        }
+        const stddev = Math.sqrt(variance / period);
+        upper[i] = middle[i] + mult * stddev;
+        lower[i] = middle[i] - mult * stddev;
+    }
+    return { upper, middle, lower };
+}
+
+function calcRSI(values, period = 14) {
+    const result = new Array(values.length).fill(null);
+    if (values.length < period + 1) return result;
+
+    let gainSum = 0, lossSum = 0;
+    for (let i = 1; i <= period; i++) {
+        const diff = values[i] - values[i - 1];
+        if (diff > 0) gainSum += diff; else lossSum -= diff;
+    }
+    let avgGain = gainSum / period;
+    let avgLoss = lossSum / period;
+    result[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+
+    for (let i = period + 1; i < values.length; i++) {
+        const diff = values[i] - values[i - 1];
+        const gain = diff > 0 ? diff : 0;
+        const loss = diff < 0 ? -diff : 0;
+        avgGain = (avgGain * (period - 1) + gain) / period;
+        avgLoss = (avgLoss * (period - 1) + loss) / period;
+        result[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+    }
+    return result;
+}
+
+function barsToSeries(times, values) {
+    const out = [];
+    for (let i = 0; i < times.length; i++) {
+        if (values[i] !== null) out.push({ time: times[i], value: values[i] });
+    }
+    return out;
+}
+
+// ── Indicator rendering ─────────────────────────────────────────────────────
+
+const IND_COLORS = {
+    sma20:  '#60a5fa',
+    sma50:  '#f59e0b',
+    sma200: '#f87171',
+    ema12:  '#34d399',
+    ema26:  '#a78bfa',
+    bb:     '#4b5563',
+    vwap:   '#38bdf8',
+};
+
+function renderIndicators(bars) {
+    if (!bars || bars.length === 0 || !state.chart) return;
+    const times = bars.map(b => b.time);
+    const closes = bars.map(b => b.close);
+
+    // SMA 20
+    if (state.indicators.sma20) {
+        if (!state.indSeries.sma20) {
+            state.indSeries.sma20 = state.chart.addLineSeries({
+                color: IND_COLORS.sma20, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            });
+        }
+        state.indSeries.sma20.setData(barsToSeries(times, calcSMA(closes, 20)));
+    }
+
+    // SMA 50
+    if (state.indicators.sma50) {
+        if (!state.indSeries.sma50) {
+            state.indSeries.sma50 = state.chart.addLineSeries({
+                color: IND_COLORS.sma50, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            });
+        }
+        state.indSeries.sma50.setData(barsToSeries(times, calcSMA(closes, 50)));
+    }
+
+    // SMA 200
+    if (state.indicators.sma200) {
+        if (!state.indSeries.sma200) {
+            state.indSeries.sma200 = state.chart.addLineSeries({
+                color: IND_COLORS.sma200, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            });
+        }
+        state.indSeries.sma200.setData(barsToSeries(times, calcSMA(closes, 200)));
+    }
+
+    // EMA 12
+    if (state.indicators.ema12) {
+        if (!state.indSeries.ema12) {
+            state.indSeries.ema12 = state.chart.addLineSeries({
+                color: IND_COLORS.ema12, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            });
+        }
+        state.indSeries.ema12.setData(barsToSeries(times, calcEMA(closes, 12)));
+    }
+
+    // EMA 26
+    if (state.indicators.ema26) {
+        if (!state.indSeries.ema26) {
+            state.indSeries.ema26 = state.chart.addLineSeries({
+                color: IND_COLORS.ema26, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            });
+        }
+        state.indSeries.ema26.setData(barsToSeries(times, calcEMA(closes, 26)));
+    }
+
+    // Bollinger Bands
+    if (state.indicators.bb) {
+        const { upper, middle, lower } = calcBB(closes, 20, 2);
+        if (!state.indSeries.bb) {
+            state.indSeries.bb = {
+                upper: state.chart.addLineSeries({ color: IND_COLORS.bb, lineWidth: 1, lineStyle: 1, priceLineVisible: false, lastValueVisible: false }),
+                middle: state.chart.addLineSeries({ color: '#6b7280', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false }),
+                lower: state.chart.addLineSeries({ color: IND_COLORS.bb, lineWidth: 1, lineStyle: 1, priceLineVisible: false, lastValueVisible: false }),
+            };
+        }
+        state.indSeries.bb.upper.setData(barsToSeries(times, upper));
+        state.indSeries.bb.middle.setData(barsToSeries(times, middle));
+        state.indSeries.bb.lower.setData(barsToSeries(times, lower));
+    }
+
+    // VWAP
+    if (state.indicators.vwap) {
+        if (!state.indSeries.vwap) {
+            state.indSeries.vwap = state.chart.addLineSeries({
+                color: IND_COLORS.vwap, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            });
+        }
+        state.indSeries.vwap.setData(bars.map(b => ({ time: b.time, value: b.vwap })));
+    }
+
+    // RSI
+    if (state.indicators.rsi) {
+        const rsiContainer = document.getElementById('rsi-container');
+        rsiContainer.classList.add('visible');
+        if (!state.rsiChart) {
+            state.rsiChart = LightweightCharts.createChart(rsiContainer, {
+                width: rsiContainer.clientWidth,
+                height: 130,
+                layout: { background: { color: '#07090e' }, textColor: '#7b8db8', fontFamily: "'JetBrains Mono', monospace" },
+                grid: { vertLines: { color: '#0d1117' }, horzLines: { color: '#0d1117' } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                rightPriceScale: { borderColor: '#1e2a3d', scaleMargins: { top: 0.1, bottom: 0.1 } },
+                timeScale: { borderColor: '#1e2a3d', timeVisible: true, secondsVisible: false, visible: true },
+                handleScroll: false,
+                handleScale: false,
+            });
+            state.rsiSeries = state.rsiChart.addLineSeries({ color: '#a78bfa', lineWidth: 1, priceLineVisible: false, lastValueVisible: true });
+            state.rsiSeries.createPriceLine({ price: 70, color: '#374151', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '70' });
+            state.rsiSeries.createPriceLine({ price: 30, color: '#374151', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '30' });
+
+            // Sync main → RSI
+            state.chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+                if (!state.rsiSyncBusy && range && state.rsiChart) {
+                    state.rsiSyncBusy = true;
+                    state.rsiChart.timeScale().setVisibleLogicalRange(range);
+                    state.rsiSyncBusy = false;
+                }
+            });
+            // Sync RSI → main
+            state.rsiChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+                if (!state.rsiSyncBusy && range) {
+                    state.rsiSyncBusy = true;
+                    state.chart.timeScale().setVisibleLogicalRange(range);
+                    state.rsiSyncBusy = false;
+                }
+            });
+        }
+        const rsiValues = calcRSI(closes, 14);
+        state.rsiSeries.setData(barsToSeries(times, rsiValues));
+        state.rsiChart.timeScale().fitContent();
+    }
+}
+
+// Update only the last data point of active indicators (called on live trades)
+function updateLiveIndicators(liveBar) {
+    if (!state.bars || state.bars.length < 2) return;
+    const bars = state.bars;
+    const times = bars.map(b => b.time);
+    const closes = bars.map(b => b.close);
+    const lastIdx = bars.length - 1;
+    const t = liveBar.time;
+
+    if (state.indSeries.sma20) {
+        const sma = calcSMA(closes, 20);
+        if (sma[lastIdx] !== null) state.indSeries.sma20.update({ time: t, value: sma[lastIdx] });
+    }
+    if (state.indSeries.sma50) {
+        const sma = calcSMA(closes, 50);
+        if (sma[lastIdx] !== null) state.indSeries.sma50.update({ time: t, value: sma[lastIdx] });
+    }
+    if (state.indSeries.ema12) {
+        const ema = calcEMA(closes, 12);
+        if (ema[lastIdx] !== null) state.indSeries.ema12.update({ time: t, value: ema[lastIdx] });
+    }
+    if (state.indSeries.ema26) {
+        const ema = calcEMA(closes, 26);
+        if (ema[lastIdx] !== null) state.indSeries.ema26.update({ time: t, value: ema[lastIdx] });
+    }
+    if (state.indSeries.vwap) {
+        state.indSeries.vwap.update({ time: t, value: liveBar.vwap });
+    }
+    if (state.rsiSeries && state.indicators.rsi) {
+        const rsi = calcRSI(closes, 14);
+        if (rsi[lastIdx] !== null) state.rsiSeries.update({ time: t, value: rsi[lastIdx] });
+    }
+    // BB — just re-render the last bar
+    if (state.indSeries.bb) {
+        const { upper, middle, lower } = calcBB(closes, 20, 2);
+        if (upper[lastIdx] !== null) {
+            state.indSeries.bb.upper.update({ time: t, value: upper[lastIdx] });
+            state.indSeries.bb.middle.update({ time: t, value: middle[lastIdx] });
+            state.indSeries.bb.lower.update({ time: t, value: lower[lastIdx] });
+        }
+    }
+}
+
+// ── Crosshair legend ────────────────────────────────────────────────────────
+
+const pf = (v) => {
+    if (v == null) return '--';
+    const d = v > 100 ? 2 : v > 1 ? 4 : 6;
+    return v.toFixed(d);
+};
+
+function clearLegend() {
+    ['leg-label','leg-o','leg-h','leg-l','leg-c','leg-v','leg-ind-values'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = '';
+    });
+}
+
+function updateLegend(time, bar, param) {
+    const d = new Date(time * 1000);
+    const label = d.toLocaleString('en-GB', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+
+    const setLeg = (id, text, className) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = text;
+        if (className) el.className = className;
+    };
+
+    setLeg('leg-label', label, 'leg-label');
+    setLeg('leg-o', `O ${pf(bar.open)}`, 'leg-o');
+    setLeg('leg-h', `H ${pf(bar.high)}`, 'leg-h');
+    setLeg('leg-l', `L ${pf(bar.low)}`, 'leg-l');
+    setLeg('leg-c', `C ${pf(bar.close)}`, bar.close >= bar.open ? 'leg-c price-up' : 'leg-c price-down');
+
+    // Volume from histogram series
+    const volData = param.seriesData.get(state.volumeSeries);
+    const vol = volData ? volData.value : null;
+    setLeg('leg-v', vol != null ? `V ${fmtNum(Math.round(vol))}` : '', 'leg-v');
+
+    // Indicator values at crosshair
+    const indParts = [];
+    const indNames = { sma20: 'SMA20', sma50: 'SMA50', sma200: 'SMA200', ema12: 'EMA12', ema26: 'EMA26', vwap: 'VWAP' };
+    for (const [key, label] of Object.entries(indNames)) {
+        const s = state.indSeries[key];
+        if (!s) continue;
+        const d = param.seriesData.get(s);
+        if (d) indParts.push(`<span style="color:${IND_COLORS[key]}">${label} ${pf(d.value)}</span>`);
+    }
+    if (state.indSeries.bb) {
+        const du = param.seriesData.get(state.indSeries.bb.upper);
+        const dl = param.seriesData.get(state.indSeries.bb.lower);
+        if (du && dl) indParts.push(`<span style="color:#9ca3af">BB ${pf(dl.value)}–${pf(du.value)}</span>`);
+    }
+    const indEl = document.getElementById('leg-ind-values');
+    if (indEl) indEl.innerHTML = indParts.join(' ');
 }

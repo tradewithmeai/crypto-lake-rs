@@ -126,8 +126,35 @@
 
             <!-- Tab panels -->
             <div class="tab-panel active" id="tab-chart">
-                <div id="chart-container">
-                    <div class="panel-loading">Loading chart data...</div>
+                <div id="chart-panel">
+                    <!-- Indicator toolbar -->
+                    <div id="indicator-toolbar">
+                        <div class="ind-group">
+                            <button class="ind-btn" data-ind="bb">BB</button>
+                            <button class="ind-btn" data-ind="sma20">SMA 20</button>
+                            <button class="ind-btn" data-ind="sma50">SMA 50</button>
+                            <button class="ind-btn" data-ind="sma200">SMA 200</button>
+                            <button class="ind-btn" data-ind="ema12">EMA 12</button>
+                            <button class="ind-btn" data-ind="ema26">EMA 26</button>
+                            <button class="ind-btn" data-ind="vwap">VWAP</button>
+                            <button class="ind-btn" data-ind="rsi">RSI 14</button>
+                        </div>
+                        <button class="reset-zoom-btn" id="reset-zoom">Reset Zoom</button>
+                    </div>
+                    <!-- Crosshair OHLCV legend -->
+                    <div id="chart-legend">
+                        <span id="leg-label"></span>
+                        <span id="leg-o"></span>
+                        <span id="leg-h"></span>
+                        <span id="leg-l"></span>
+                        <span id="leg-c"></span>
+                        <span id="leg-v"></span>
+                        <span id="leg-ind-values"></span>
+                    </div>
+                    <!-- Main chart -->
+                    <div id="chart-container"></div>
+                    <!-- RSI sub-pane -->
+                    <div id="rsi-container"></div>
                 </div>
             </div>
 

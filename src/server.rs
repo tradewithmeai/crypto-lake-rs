@@ -141,6 +141,7 @@ struct BarRow {
     close: f64,
     volume_base: f64,
     trade_count: u64,
+    vwap: f64,
 }
 
 // GET /api/v1/bars/{symbol}/latest?tf=5m&limit=500
@@ -198,11 +199,12 @@ async fn read_parquet_bars(
     parquet_files.sort_by(|a, b| b.cmp(a));
     parquet_files.truncate(10); // Only read the 10 most recent files
 
-    let mut raw_bars: Vec<(i64, f64, f64, f64, f64, f64, u64)> = Vec::new();
+    // (ts_sec, open, high, low, close, volume, trade_count, vwap)
+    let mut raw_bars: Vec<(i64, f64, f64, f64, f64, f64, u64, f64)> = Vec::new();
 
     for file_path in &parquet_files {
         let path = file_path.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, f64, f64, f64, f64, f64, u64)>, Box<dyn std::error::Error + Send + Sync>> {
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, f64, f64, f64, f64, f64, u64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
             let file = std::fs::File::open(&path)?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
                 .build()?;
@@ -217,14 +219,15 @@ async fn read_parquet_bars(
                 let close_col = batch.column(6).as_any().downcast_ref::<arrow::array::Float64Array>();
                 let vol_col = batch.column(7).as_any().downcast_ref::<arrow::array::Float64Array>();
                 let count_col = batch.column(9).as_any().downcast_ref::<arrow::array::UInt64Array>();
+                let vwap_col = batch.column(10).as_any().downcast_ref::<arrow::array::Float64Array>();
 
-                if let (Some(ts), Some(o), Some(h), Some(l), Some(c), Some(v), Some(cnt)) =
-                    (ts_col, open_col, high_col, low_col, close_col, vol_col, count_col)
+                if let (Some(ts), Some(o), Some(h), Some(l), Some(c), Some(v), Some(cnt), Some(vw)) =
+                    (ts_col, open_col, high_col, low_col, close_col, vol_col, count_col, vwap_col)
                 {
                     for i in 0..batch.num_rows() {
                         let ts_us = ts.value(i);
                         let ts_sec = ts_us / 1_000_000;
-                        rows.push((ts_sec, o.value(i), h.value(i), l.value(i), c.value(i), v.value(i), cnt.value(i)));
+                        rows.push((ts_sec, o.value(i), h.value(i), l.value(i), c.value(i), v.value(i), cnt.value(i), vw.value(i)));
                     }
                 }
             }
@@ -238,24 +241,28 @@ async fn read_parquet_bars(
         return Ok(Vec::new());
     }
 
-    // Aggregate 1s bars into requested timeframe
-    let mut agg: HashMap<i64, (f64, f64, f64, f64, f64, u64)> = HashMap::new();
-    for (ts, o, h, l, c, v, cnt) in &raw_bars {
+    // Aggregate 1s bars into requested timeframe.
+    // Map value: (open, high, low, close, vol, cnt, vwap_notional, vol_for_vwap)
+    let mut agg: HashMap<i64, (f64, f64, f64, f64, f64, u64, f64, f64)> = HashMap::new();
+    for (ts, o, h, l, c, v, cnt, vwap) in &raw_bars {
         let bucket = (*ts / tf_seconds) * tf_seconds;
         agg.entry(bucket)
-            .and_modify(|(_, ah, al, ac, av, acnt)| {
+            .and_modify(|(_, ah, al, ac, av, acnt, avn, avv)| {
                 *ah = ah.max(*h);
                 *al = al.min(*l);
                 *ac = *c; // latest close wins
                 *av += v;
                 *acnt += cnt;
+                *avn += vwap * v; // accumulate vwap numerator
+                *avv += v;        // accumulate vwap denominator
             })
-            .or_insert((*o, *h, *l, *c, *v, *cnt));
+            .or_insert((*o, *h, *l, *c, *v, *cnt, vwap * v, *v));
     }
 
     let mut bars: Vec<BarRow> = agg
         .into_iter()
-        .map(|(ts, (open, high, low, close, vol, cnt))| {
+        .map(|(ts, (open, high, low, close, vol, cnt, vwap_n, vwap_v))| {
+            let vwap = if vwap_v > 0.0 { vwap_n / vwap_v } else { close };
             let dt = chrono::DateTime::from_timestamp(ts, 0)
                 .unwrap_or_default()
                 .format("%Y-%m-%dT%H:%M:%SZ")
@@ -268,6 +275,7 @@ async fn read_parquet_bars(
                 close,
                 volume_base: vol,
                 trade_count: cnt,
+                vwap,
             }
         })
         .collect();
