@@ -29,6 +29,8 @@ pub async fn run(
     max_reconnect_backoff: u64,
     reconnect_jitter: f64,
     counters: Arc<HealthCounters>,
+    backfill_tx: mpsc::UnboundedSender<String>,
+    gap_threshold: u64,
 ) {
     let exchange_name = exchange_cfg.name.clone();
     let mut backoff = reconnect_backoff;
@@ -45,15 +47,18 @@ pub async fn run(
 
                 if let Some(disc_time) = last_disconnect.take() {
                     counters.ws_reconnects.fetch_add(1, Ordering::Relaxed);
-                    let gap = disc_time.elapsed().as_secs_f64();
+                    let gap_secs = disc_time.elapsed().as_secs();
                     events::log_connection_event(
                         &data_path.join("raw"),
                         &exchange_name,
                         "reconnect",
                         "",
-                        gap,
+                        gap_secs as f64,
                     )
                     .await;
+                    if gap_secs >= gap_threshold {
+                        let _ = backfill_tx.send(exchange_name.clone());
+                    }
                 } else {
                     events::log_connection_event(
                         &data_path.join("raw"),

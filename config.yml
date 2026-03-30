@@ -27,6 +27,7 @@ exchanges:
     wss_url: "wss://stream.binance.com:9443/ws"
 
   - name: "coinbase"
+    bar_interval_sec: 60    # 1-minute bars; matches backfill resolution
     symbols:
       - BTC-USD
       - ETH-USD
@@ -35,6 +36,7 @@ exchanges:
     wss_url: "wss://ws-feed.exchange.coinbase.com"
 
   - name: "kraken"
+    bar_interval_sec: 60    # 1-minute bars; matches backfill resolution
     symbols:
       - BTC/USD
       - ETH/USD
@@ -61,5 +63,5 @@ server:
 backfill:
   enabled: true
   gap_threshold_secs: 60      # minimum gap to trigger backfill
-  max_backfill_secs: 86400    # max 24 hours of backfill
+  max_backfill_secs: 2592000  # max 30 days of backfill
   timeout_secs: 300           # abort backfill if no network

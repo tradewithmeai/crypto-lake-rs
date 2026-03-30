@@ -43,6 +43,10 @@ pub struct Exchange {
     #[serde(default)]
     pub rest_url: String,
     pub wss_url: String,
+    /// Bar aggregation interval in seconds. Default 1 (1-second bars).
+    /// Set to 60 for exchanges where only 1-minute backfill is available (Coinbase, Kraken).
+    #[serde(default = "default_bar_interval_sec")]
+    pub bar_interval_sec: u64,
 }
 
 #[allow(dead_code)]
@@ -112,8 +116,9 @@ fn default_server_port() -> u16 { 8000 }
 fn default_static_dir() -> String { "./static".into() }
 fn default_backfill_enabled() -> bool { true }
 fn default_gap_threshold_secs() -> u64 { 60 }
-fn default_max_backfill_secs() -> u64 { 86400 }
+fn default_max_backfill_secs() -> u64 { 2_592_000 } // 30 days
 fn default_timeout_secs() -> u64 { 300 }
+fn default_bar_interval_sec() -> u64 { 1 }
 
 impl Default for Server {
     fn default() -> Self {

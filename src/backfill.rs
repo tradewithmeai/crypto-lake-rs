@@ -8,6 +8,23 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// Run backfill for a specific subset of exchanges (by name).
+/// Used by the reconnect-triggered backfill runner.
+pub async fn run_for_exchanges(
+    exchange_names: &[String],
+    exchanges: &[Exchange],
+    data_path: &Path,
+    backfill_cfg: &Backfill,
+    compression: &str,
+) {
+    let filtered: Vec<Exchange> = exchanges.iter()
+        .filter(|e| exchange_names.contains(&e.name))
+        .cloned()
+        .collect();
+    if filtered.is_empty() { return; }
+    run(&filtered, data_path, backfill_cfg, compression).await;
+}
+
 /// Run startup backfill for all configured exchanges.
 ///
 /// For each exchange/symbol pair, scans existing parquet data to find the most

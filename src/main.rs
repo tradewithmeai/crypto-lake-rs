@@ -14,10 +14,11 @@ mod tray;
 use clap::Parser;
 use config::Config;
 use health::HealthCounters;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -243,9 +244,17 @@ async fn run_collector(
     // Broadcast channel for real-time WebSocket streaming
     let (broadcast_tx, _) = broadcast::channel::<collector::TradeEvent>(4096);
 
-    // Spawn the trade aggregator (trades -> 1s bars)
+    // Build per-exchange bar interval map (default 1s; Coinbase/Kraken use 60s)
+    let bar_intervals: HashMap<String, u64> = cfg.exchanges.iter()
+        .map(|e| (e.name.clone(), e.bar_interval_sec))
+        .collect();
+
+    // Spawn the trade aggregator (trades -> OHLCV bars at per-exchange interval)
     let (trade_tx, trade_rx) = tokio::sync::mpsc::unbounded_channel();
-    let bar_rx = transformer::aggregator::spawn_aggregator(trade_rx, counters.clone());
+    let bar_rx = transformer::aggregator::spawn_aggregator(trade_rx, counters.clone(), bar_intervals);
+
+    // Backfill trigger channel: collectors send exchange name on reconnect after a gap
+    let (backfill_tx, mut backfill_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Spawn the Parquet writer (1s bars -> Parquet files, returns shutdown handle)
     let parquet_shutdown = transformer::parquet_writer::spawn_parquet_writer(
@@ -307,8 +316,73 @@ async fn run_collector(
         info!("Backfill: skipped (--no-backfill flag)");
     }
 
+    // Shared mutex to prevent concurrent backfill runs
+    let backfill_lock = Arc::new(Mutex::new(()));
+
+    // Reconnect-triggered backfill runner.
+    // Collectors send their exchange name when they reconnect after a gap.
+    // A 5-second debounce collects all reconnecting exchanges (they usually
+    // reconnect within seconds of each other), then runs a single backfill pass.
+    if cfg.backfill.enabled {
+        let exchanges_bf = cfg.exchanges.clone();
+        let backfill_cfg_rf = cfg.backfill.clone();
+        let data_path_rf = data_path.clone();
+        let compression_rf = cfg.transformer.parquet_compression.clone();
+        let lock_rf = backfill_lock.clone();
+
+        tokio::spawn(async move {
+            let mut pending: HashSet<String> = HashSet::new();
+            let mut debounce = tokio::time::interval(std::time::Duration::from_secs(5));
+            debounce.tick().await; // skip immediate first tick
+
+            loop {
+                tokio::select! {
+                    Some(name) = backfill_rx.recv() => {
+                        pending.insert(name);
+                    }
+                    _ = debounce.tick() => {
+                        if !pending.is_empty() {
+                            let names: Vec<String> = pending.drain().collect();
+                            let _guard = lock_rf.lock().await;
+                            info!("Reconnect-triggered backfill for: {:?}", names);
+                            backfill::run_for_exchanges(
+                                &names, &exchanges_bf, &data_path_rf,
+                                &backfill_cfg_rf, &compression_rf,
+                            ).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Daily scheduled backfill — runs every 24 hours to catch any gaps.
+    if cfg.backfill.enabled {
+        let exchanges_daily = cfg.exchanges.clone();
+        let backfill_cfg_daily = cfg.backfill.clone();
+        let data_path_daily = data_path.clone();
+        let compression_daily = cfg.transformer.parquet_compression.clone();
+        let lock_daily = backfill_lock.clone();
+
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+            timer.tick().await; // skip first tick (startup backfill already ran)
+            loop {
+                timer.tick().await;
+                let _guard = lock_daily.lock().await;
+                info!("Daily scheduled backfill starting...");
+                backfill::run(
+                    &exchanges_daily, &data_path_daily,
+                    &backfill_cfg_daily, &compression_daily,
+                ).await;
+            }
+        });
+    }
+
     // Spawn exchange collectors
-    // Binance (primary)
+    let gap_threshold = cfg.backfill.gap_threshold_secs;
+
+    // Binance (primary — 1-second bars)
     if let Some(binance_cfg) = cfg.exchange("binance").cloned() {
         let wtx = writer_tx.clone();
         let ttx = trade_tx.clone();
@@ -318,16 +392,17 @@ async fn run_collector(
         let mrb = cfg.collector.max_reconnect_backoff;
         let rj = cfg.collector.reconnect_jitter;
         let ctrs = counters.clone();
+        let bftx = backfill_tx.clone();
 
         let symbols_count = binance_cfg.symbols.len();
         info!("[binance] Starting collector for {} symbols", symbols_count);
 
         tokio::spawn(async move {
-            collector::binance::run(binance_cfg, wtx, ttx, btx, dp, rb, mrb, rj, ctrs).await;
+            collector::binance::run(binance_cfg, wtx, ttx, btx, dp, rb, mrb, rj, ctrs, bftx, gap_threshold).await;
         });
     }
 
-    // Coinbase (backup)
+    // Coinbase (60-second bars)
     if let Some(coinbase_cfg) = cfg.exchange("coinbase").cloned() {
         let wtx = writer_tx.clone();
         let ttx = trade_tx.clone();
@@ -337,16 +412,17 @@ async fn run_collector(
         let mrb = cfg.collector.max_reconnect_backoff;
         let rj = cfg.collector.reconnect_jitter;
         let ctrs = counters.clone();
+        let bftx = backfill_tx.clone();
 
         let symbols_count = coinbase_cfg.symbols.len();
         info!("[coinbase] Starting collector for {} symbols", symbols_count);
 
         tokio::spawn(async move {
-            collector::coinbase::run(coinbase_cfg, wtx, ttx, btx, dp, rb, mrb, rj, ctrs).await;
+            collector::coinbase::run(coinbase_cfg, wtx, ttx, btx, dp, rb, mrb, rj, ctrs, bftx, gap_threshold).await;
         });
     }
 
-    // Kraken (backup)
+    // Kraken (60-second bars)
     if let Some(kraken_cfg) = cfg.exchange("kraken").cloned() {
         let wtx = writer_tx.clone();
         let ttx = trade_tx.clone();
@@ -356,12 +432,13 @@ async fn run_collector(
         let mrb = cfg.collector.max_reconnect_backoff;
         let rj = cfg.collector.reconnect_jitter;
         let ctrs = counters.clone();
+        let bftx = backfill_tx.clone();
 
         let symbols_count = kraken_cfg.symbols.len();
         info!("[kraken] Starting collector for {} symbols", symbols_count);
 
         tokio::spawn(async move {
-            collector::kraken::run(kraken_cfg, wtx, ttx, btx, dp, rb, mrb, rj, ctrs).await;
+            collector::kraken::run(kraken_cfg, wtx, ttx, btx, dp, rb, mrb, rj, ctrs, bftx, gap_threshold).await;
         });
     }
 

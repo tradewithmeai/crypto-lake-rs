@@ -107,16 +107,18 @@ type SymbolKey = (String, String);
 
 /// Spawn the aggregator task.
 ///
-/// Consumes trade events, accumulates into 1-second bars, and sends
-/// completed bars to the parquet writer via the returned receiver.
+/// Consumes trade events and accumulates them into OHLCV bars. The bar
+/// interval is configurable per exchange: Binance uses 1-second bars,
+/// while Coinbase and Kraken use 60-second bars to match the resolution
+/// available from their backfill REST APIs.
 ///
-/// Emits a bar for every second the collector is running per symbol.
-/// Seconds with no trades get `trade_count=0` with the last known
-/// close price carried forward, so gaps in parquet data always mean
-/// the collector was genuinely offline.
+/// Emits a bar for every complete interval per symbol. Intervals with no
+/// trades get `trade_count=0` with the last known close price carried
+/// forward, so gaps in parquet data always mean the collector was offline.
 pub fn spawn_aggregator(
     mut trade_rx: mpsc::UnboundedReceiver<TradeEvent>,
     counters: Arc<HealthCounters>,
+    bar_intervals: HashMap<String, u64>,
 ) -> mpsc::UnboundedReceiver<Bar1s> {
     let (bar_tx, bar_rx) = mpsc::unbounded_channel::<Bar1s>();
 
@@ -125,45 +127,54 @@ pub fn spawn_aggregator(
         let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(2));
         let mut total_bars = 0u64;
 
-        // Track last emitted second and last close price per symbol
+        // Track last emitted bucket timestamp and last close price per symbol.
+        // For 1s intervals, bucket_ts == second_ts.
+        // For 60s intervals, bucket_ts is the start of the minute (floor to 60s).
         let mut last_emitted: HashMap<SymbolKey, i64> = HashMap::new();
         let mut last_close: HashMap<SymbolKey, f64> = HashMap::new();
 
         loop {
             tokio::select! {
                 Some(trade) = trade_rx.recv() => {
-                    // Use wall-clock receive time, not Binance trade time.
-                    // On poor mobile connections, Binance messages can arrive with
-                    // timestamps minutes in the past (TCP buffer delay). Using trade
-                    // time would cause last_emitted to advance past the trade's second,
-                    // silently discarding it. Receive time guarantees the trade always
-                    // lands in a current bucket. Raw JSONL files preserve original timestamps.
-                    let second_ts = chrono::Utc::now().timestamp();
+                    // Use wall-clock receive time, not exchange trade timestamp.
+                    // On poor mobile connections, messages can arrive with timestamps
+                    // minutes in the past (TCP buffer delay). Using trade time would
+                    // cause last_emitted to advance past the trade's bucket, silently
+                    // discarding it. Receive time guarantees the trade always lands in
+                    // a current bucket. Raw JSONL files preserve original timestamps.
+                    let now = chrono::Utc::now().timestamp();
+                    let interval = bar_intervals.get(&trade.exchange).copied().unwrap_or(1) as i64;
+                    let bucket_ts = (now / interval) * interval;
                     let sym_key = (trade.exchange.clone(), trade.symbol.clone());
 
                     // Initialize tracking on first trade for this symbol
-                    last_emitted.entry(sym_key.clone()).or_insert(second_ts - 1);
+                    last_emitted.entry(sym_key.clone()).or_insert(bucket_ts - interval);
                     last_close.entry(sym_key).or_insert(trade.price);
 
-                    let key = (trade.exchange.clone(), trade.symbol.clone(), second_ts);
+                    let key = (trade.exchange.clone(), trade.symbol.clone(), bucket_ts);
                     accumulators
                         .entry(key)
                         .and_modify(|acc| acc.update(&trade))
-                        .or_insert_with(|| BarAccumulator::new(&trade, second_ts));
+                        .or_insert_with(|| BarAccumulator::new(&trade, bucket_ts));
                 }
                 _ = flush_interval.tick() => {
-                    let cutoff = chrono::Utc::now().timestamp() - 2;
+                    let now = chrono::Utc::now().timestamp();
                     let mut flushed = 0u64;
 
-                    // For each tracked symbol, emit bars for every second
-                    // from last_emitted+1 through cutoff
                     let symbols: Vec<SymbolKey> = last_emitted.keys().cloned().collect();
 
                     for sym_key in &symbols {
                         let last = *last_emitted.get(sym_key).unwrap();
                         let price = *last_close.get(sym_key).unwrap_or(&0.0);
+                        let interval = bar_intervals.get(&sym_key.0).copied().unwrap_or(1) as i64;
 
-                        for ts in (last + 1)..=cutoff {
+                        // A bucket at `ts` is complete when now >= ts + interval.
+                        // cutoff_bucket is the start of the most recent complete bucket.
+                        let cutoff_bucket = ((now - interval) / interval) * interval;
+
+                        // Emit all complete buckets after last_emitted
+                        let mut ts = last + interval;
+                        while ts <= cutoff_bucket {
                             let bar_key = (sym_key.0.clone(), sym_key.1.clone(), ts);
 
                             let bar = if let Some(acc) = accumulators.remove(&bar_key) {
@@ -172,7 +183,7 @@ pub fn spawn_aggregator(
                                 last_close.insert(sym_key.clone(), b.close);
                                 b
                             } else {
-                                // Empty bar — no trades this second
+                                // Empty bar — no trades in this interval
                                 Bar1s {
                                     exchange: sym_key.0.clone(),
                                     symbol: sym_key.1.clone(),
@@ -198,9 +209,13 @@ pub fn spawn_aggregator(
                                 info!("Aggregator: {} total bars produced", total_bars);
                             }
                             let _ = bar_tx.send(bar);
+                            ts += interval;
                         }
 
-                        last_emitted.insert(sym_key.clone(), cutoff);
+                        // Advance last_emitted if we emitted anything
+                        if cutoff_bucket >= last + interval {
+                            last_emitted.insert(sym_key.clone(), cutoff_bucket);
+                        }
                     }
 
                     if flushed > 0 {
