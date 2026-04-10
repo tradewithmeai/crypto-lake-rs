@@ -64,4 +64,4 @@ backfill:
   enabled: true
   gap_threshold_secs: 60      # minimum gap to trigger backfill
   max_backfill_secs: 2592000  # max 30 days of backfill
-  timeout_secs: 300           # abort backfill if no network
+  timeout_secs: 1800          # 30 min — covers internal gap fill for all symbols

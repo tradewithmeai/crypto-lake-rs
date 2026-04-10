@@ -4,6 +4,7 @@ use crate::transformer::parquet_writer;
 use arrow::array::Array;
 use chrono::{DateTime, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::file::statistics::Statistics;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -107,6 +108,74 @@ async fn backfill_exchange(
             _ => symbol.clone(),
         };
 
+        // ── Phase 1: fill internal gaps ──────────────────────────────────────
+        // Scan all existing data for holes (gaps caused by the app being offline
+        // while it was live-collecting at other times). These will not be found
+        // by the trailing-gap fill below.
+        let internal_gaps =
+            find_internal_gaps(data_path, exchange_name, &safe_symbol, gap_threshold, max_backfill).await;
+
+        if !internal_gaps.is_empty() {
+            info!(
+                "Backfill: [{}] {} — {} internal gap(s) to fill",
+                exchange_name, symbol, internal_gaps.len()
+            );
+        }
+
+        for (gap_start, gap_end) in &internal_gaps {
+            let gap_secs = gap_end - gap_start;
+            if gap_secs as u64 > max_backfill {
+                warn!(
+                    "Backfill: [{}] {} — internal gap {}s exceeds max_backfill {}s, skipping",
+                    exchange_name, symbol, gap_secs, max_backfill
+                );
+                continue;
+            }
+
+            info!(
+                "Backfill: [{}] {} — filling internal gap {}s ({} → {})",
+                exchange_name, symbol, gap_secs, gap_start, gap_end
+            );
+
+            // Fetch bars that fall strictly inside the gap (gap_start+1 .. gap_end-1),
+            // i.e., bars that have no representation in the parquet files yet.
+            let fetch_start = gap_start + 1;
+            let fetch_end   = gap_end - 1;
+            if fetch_start >= fetch_end {
+                continue;
+            }
+
+            let bars = match exchange_name.as_str() {
+                "binance"  => fetch_binance (&client, rest_url, symbol, fetch_start, fetch_end).await,
+                "coinbase" => fetch_coinbase(&client, rest_url, symbol, fetch_start, fetch_end).await,
+                "kraken"   => fetch_kraken  (&client, rest_url, symbol, fetch_start, fetch_end).await,
+                other => {
+                    warn!("Backfill: unknown exchange '{}', skipping", other);
+                    continue;
+                }
+            };
+
+            match bars {
+                Ok(bars) if !bars.is_empty() => {
+                    info!(
+                        "Backfill: [{}] {} — internal gap: fetched {} bars",
+                        exchange_name, symbol, bars.len()
+                    );
+                    if let Err(e) = parquet_writer::write_bars(&bars, data_path, compression).await {
+                        warn!(
+                            "Backfill: [{}] {} — internal gap write error: {}",
+                            exchange_name, symbol, e
+                        );
+                    }
+                }
+                Ok(_) => info!("Backfill: [{}] {} — internal gap: no bars returned", exchange_name, symbol),
+                Err(e) => warn!("Backfill: [{}] {} — internal gap fetch error: {}", exchange_name, symbol, e),
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // ── Phase 2: fill trailing gap (latest bar → now) ────────────────────
         let last_ts = scan_latest_timestamp(data_path, exchange_name, &safe_symbol).await;
 
         let gap_secs = match last_ts {
@@ -119,7 +188,7 @@ async fn backfill_exchange(
 
         if gap_secs < gap_threshold as i64 {
             info!(
-                "Backfill: [{}] {} — gap {}s < threshold {}s, skipping",
+                "Backfill: [{}] {} — trailing gap {}s < threshold {}s, skipping",
                 exchange_name, symbol, gap_secs, gap_threshold
             );
             continue;
@@ -130,7 +199,7 @@ async fn backfill_exchange(
         let end_ts = now.min(max_end);
 
         info!(
-            "Backfill: [{}] {} — gap {}s, fetching from {} to {}",
+            "Backfill: [{}] {} — trailing gap {}s, fetching from {} to {}",
             exchange_name, symbol, gap_secs, start_ts, end_ts
         );
 
@@ -147,24 +216,178 @@ async fn backfill_exchange(
         match bars {
             Ok(bars) if !bars.is_empty() => {
                 info!(
-                    "Backfill: [{}] {} — fetched {} bars",
+                    "Backfill: [{}] {} — trailing: fetched {} bars",
                     exchange_name, symbol, bars.len()
                 );
                 if let Err(e) = parquet_writer::write_bars(&bars, data_path, compression).await {
-                    warn!("Backfill: [{}] {} — write error: {}", exchange_name, symbol, e);
+                    warn!("Backfill: [{}] {} — trailing write error: {}", exchange_name, symbol, e);
                 }
             }
             Ok(_) => {
-                info!("Backfill: [{}] {} — no bars returned", exchange_name, symbol);
+                info!("Backfill: [{}] {} — trailing: no bars returned", exchange_name, symbol);
             }
             Err(e) => {
-                warn!("Backfill: [{}] {} — fetch error: {}", exchange_name, symbol, e);
+                warn!("Backfill: [{}] {} — trailing fetch error: {}", exchange_name, symbol, e);
             }
         }
 
         // Rate limiting between requests
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// Read the min and max `window_start` timestamps from a parquet file using column
+/// statistics stored in the file footer — no row data is read.
+/// Falls back to a full row scan if statistics are unavailable.
+/// Returns (min_ts_secs, max_ts_secs).
+fn read_file_ts_range(path: &Path) -> Option<(i64, i64)> {
+    let file = std::fs::File::open(path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+
+    // Locate the window_start column index in the Arrow schema
+    let col_idx = builder
+        .schema()
+        .fields()
+        .iter()
+        .position(|f| f.name() == "window_start")?;
+
+    let metadata = builder.metadata();
+    let mut global_min: Option<i64> = None;
+    let mut global_max: Option<i64> = None;
+    let mut stats_found = false;
+
+    for rg in metadata.row_groups() {
+        if col_idx >= rg.num_columns() {
+            continue;
+        }
+        if let Some(stats) = rg.column(col_idx).statistics() {
+            // TIMESTAMP_MICROS is stored as INT64 in parquet physical type
+            if let Statistics::Int64(s) = stats {
+                stats_found = true;
+                if let Some(&mn) = s.min_opt() {
+                    let secs = mn / 1_000_000;
+                    global_min = Some(global_min.map_or(secs, |v: i64| v.min(secs)));
+                }
+                if let Some(&mx) = s.max_opt() {
+                    let secs = mx / 1_000_000;
+                    global_max = Some(global_max.map_or(secs, |v: i64| v.max(secs)));
+                }
+            }
+        }
+    }
+
+    if stats_found {
+        return match (global_min, global_max) {
+            (Some(mn), Some(mx)) => Some((mn, mx)),
+            _ => None,
+        };
+    }
+
+    // Fallback: read all rows (older files written without stats)
+    let file2 = std::fs::File::open(path).ok()?;
+    let builder2 = ParquetRecordBatchReaderBuilder::try_new(file2).ok()?;
+    let reader = builder2.build().ok()?;
+    let mut mn: Option<i64> = None;
+    let mut mx: Option<i64> = None;
+    for batch in reader {
+        let batch = batch.ok()?;
+        let col = batch
+            .column_by_name("window_start")?
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()?;
+        for i in 0..col.len() {
+            if !col.is_null(i) {
+                let secs = col.value(i) / 1_000_000;
+                mn = Some(mn.map_or(secs, |v: i64| v.min(secs)));
+                mx = Some(mx.map_or(secs, |v: i64| v.max(secs)));
+            }
+        }
+    }
+    match (mn, mx) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// Scan all parquet files for an exchange/symbol and return a sorted list of
+/// `(min_ts_secs, max_ts_secs)` ranges, one per file.
+fn collect_file_ranges(parquet_dir: &Path) -> Vec<(i64, i64)> {
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    let mut partition_dirs = Vec::new();
+    collect_leaf_dirs(parquet_dir, &mut partition_dirs);
+    partition_dirs.sort();
+
+    for dir in &partition_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+                continue;
+            }
+            if let Some((mn, mx)) = read_file_ts_range(&path) {
+                ranges.push((mn, mx));
+            }
+        }
+    }
+
+    // Sort by file min timestamp
+    ranges.sort_by_key(|r| r.0);
+    ranges
+}
+
+/// Detect internal time gaps within an exchange/symbol's parquet data.
+///
+/// Works by reading min/max timestamps from each file's parquet footer statistics,
+/// then checking for holes between consecutive files. Only gaps larger than
+/// `gap_threshold_secs` are returned. Files older than `max_backfill_secs` before
+/// now are skipped — there's no point scanning data we can't fill.
+///
+/// Returns a list of `(gap_start_exclusive, gap_end_exclusive)` pairs in Unix seconds.
+/// These are the exact timestamps of the last bar before the gap and the first bar
+/// after it — safe to use as backfill [start+1 .. end-1] boundaries.
+async fn find_internal_gaps(
+    data_path: &Path,
+    exchange: &str,
+    symbol: &str,
+    gap_threshold_secs: u64,
+    max_backfill_secs: u64,
+) -> Vec<(i64, i64)> {
+    let parquet_dir = data_path.join("parquet").join(exchange).join(symbol);
+    if !parquet_dir.exists() {
+        return vec![];
+    }
+
+    // Cutoff: ignore files whose max timestamp is older than max_backfill_secs
+    let earliest_ts = Utc::now().timestamp() - max_backfill_secs as i64;
+
+    // Blocking file I/O — run on the thread pool
+    let parquet_dir = parquet_dir.clone();
+    let ranges = tokio::task::spawn_blocking(move || {
+        collect_file_ranges(&parquet_dir)
+            .into_iter()
+            .filter(|(_mn, mx)| *mx >= earliest_ts)
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+
+    if ranges.len() < 2 {
+        return vec![];
+    }
+
+    let mut gaps = Vec::new();
+    for i in 1..ranges.len() {
+        let prev_max = ranges[i - 1].1;
+        let next_min = ranges[i].0;
+        let gap_secs = next_min - prev_max;
+        if gap_secs > 0 && gap_secs as u64 > gap_threshold_secs {
+            gaps.push((prev_max, next_min));
+        }
+    }
+
+    gaps
 }
 
 /// Scan parquet files to find the most recent `window_start` timestamp for an exchange/symbol.
@@ -201,8 +424,9 @@ async fn scan_latest_timestamp(
                 continue;
             }
 
-            if let Some(ts) = read_max_timestamp(&path) {
-                latest_ts = Some(latest_ts.map_or(ts, |prev: i64| prev.max(ts)));
+            // Use the new unified range reader; we only need the max here
+            if let Some((_mn, mx)) = read_file_ts_range(&path) {
+                latest_ts = Some(latest_ts.map_or(mx, |prev: i64| prev.max(mx)));
             }
         }
     }
@@ -229,38 +453,6 @@ fn collect_leaf_dirs(dir: &Path, results: &mut Vec<PathBuf>) {
     if !has_subdirs {
         results.push(dir.to_path_buf());
     }
-}
-
-/// Read the maximum `window_start` timestamp from a parquet file.
-/// Returns epoch seconds.
-fn read_max_timestamp(path: &Path) -> Option<i64> {
-    let file = std::fs::File::open(path).ok()?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
-    let reader = builder.build().ok()?;
-
-    let mut max_ts: Option<i64> = None;
-
-    for batch in reader {
-        let batch = match batch {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-
-        let ts_col = batch
-            .column_by_name("window_start")?
-            .as_any()
-            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()?;
-
-        for i in 0..ts_col.len() {
-            if !ts_col.is_null(i) {
-                // Convert microseconds to seconds
-                let ts_secs = ts_col.value(i) / 1_000_000;
-                max_ts = Some(max_ts.map_or(ts_secs, |prev| prev.max(ts_secs)));
-            }
-        }
-    }
-
-    max_ts
 }
 
 // ── Exchange REST fetchers ──────────────────────────────────────────────────
