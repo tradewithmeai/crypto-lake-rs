@@ -50,6 +50,10 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 # Error handling
 anyhow = "1"
 
+# HMAC-SHA256 signing (Betty Sentinel agent)
+hmac = "0.12"
+sha2 = "0.10"
+
 # System tray (Windows only)
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.19"

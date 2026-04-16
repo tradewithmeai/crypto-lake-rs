@@ -65,3 +65,20 @@ backfill:
   gap_threshold_secs: 60      # minimum gap to trigger backfill
   max_backfill_secs: 2592000  # max 30 days of backfill
   timeout_secs: 1800          # 30 min — covers internal gap fill for all symbols
+
+betty:
+  enabled: true
+  url: http://localhost:8400
+  agent_id: home-desktop
+  secret_hex: 56cb43200fb1c2232af2865c34409afa3f0e13f08d482e129a1613a794e1d168
+  interval_sec: 60             # how often to send heartbeat + service-state
+  stale_threshold_sec: 300     # warn if last parquet write is older than this
+
+archive:
+  provider: "rclone"           # "rclone" or "local"
+  rclone_remote: "gdrive"      # name given to the remote during `rclone config`
+  rclone_dest: "crypto-lake"   # folder inside Google Drive root
+  local_dest: ""               # optional: path to external drive, e.g. "E:/crypto-lake-backup"
+  sync_on_startup: false       # if true, app triggers sync at startup (future)
+  consolidate_days_older: 7    # consolidate per-minute files into per-day for data older than N days
+  schedule_time: "03:00"       # daily sync time for Windows Task Scheduler (HH:MM, 24h)

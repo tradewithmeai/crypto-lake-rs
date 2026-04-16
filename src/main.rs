@@ -1,4 +1,5 @@
 mod backfill;
+mod betty;
 mod cleanup;
 mod collector;
 mod config;
@@ -291,6 +292,14 @@ async fn run_collector(
         health_interval,
     );
 
+    // Spawn Betty Sentinel agent (no-op if betty.enabled = false in config)
+    betty::spawn_betty_task(
+        cfg.betty.clone(),
+        data_path.clone(),
+        counters.clone(),
+        shutdown.clone(),
+    );
+
     // Spawn dashboard server
     {
         let server_cfg = cfg.clone();
@@ -302,16 +311,17 @@ async fn run_collector(
         });
     }
 
-    // Run startup backfill (before starting live collectors)
+    // Run startup backfill in the background so live collectors start immediately
     if !no_backfill && cfg.backfill.enabled {
-        info!("Running startup backfill...");
-        backfill::run(
-            &cfg.exchanges,
-            &data_path,
-            &cfg.backfill,
-            &cfg.transformer.parquet_compression,
-        )
-        .await;
+        let bf_exchanges   = cfg.exchanges.clone();
+        let bf_data_path   = data_path.clone();
+        let bf_cfg         = cfg.backfill.clone();
+        let bf_compression = cfg.transformer.parquet_compression.clone();
+        tokio::spawn(async move {
+            info!("Startup backfill: running in background...");
+            backfill::run(&bf_exchanges, &bf_data_path, &bf_cfg, &bf_compression).await;
+            info!("Startup backfill: complete");
+        });
     } else if no_backfill {
         info!("Backfill: skipped (--no-backfill flag)");
     }

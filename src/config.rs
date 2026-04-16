@@ -13,6 +13,8 @@ pub struct Config {
     pub server: Server,
     #[serde(default)]
     pub backfill: Backfill,
+    #[serde(default)]
+    pub betty: Betty,
 }
 
 #[allow(dead_code)]
@@ -119,6 +121,40 @@ fn default_gap_threshold_secs() -> u64 { 60 }
 fn default_max_backfill_secs() -> u64 { 2_592_000 } // 30 days
 fn default_timeout_secs() -> u64 { 300 }
 fn default_bar_interval_sec() -> u64 { 1 }
+fn default_betty_url() -> String { "http://localhost:8400".into() }
+fn default_betty_agent_id() -> String { "home-desktop".into() }
+fn default_betty_interval() -> u64 { 60 }
+fn default_betty_stale_threshold() -> u64 { 300 }
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct Betty {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_betty_url")]
+    pub url: String,
+    #[serde(default = "default_betty_agent_id")]
+    pub agent_id: String,
+    #[serde(default)]
+    pub secret_hex: String,
+    #[serde(default = "default_betty_interval")]
+    pub interval_sec: u64,
+    #[serde(default = "default_betty_stale_threshold")]
+    pub stale_threshold_sec: u64,
+}
+
+impl Default for Betty {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: default_betty_url(),
+            agent_id: default_betty_agent_id(),
+            secret_hex: String::new(),
+            interval_sec: default_betty_interval(),
+            stale_threshold_sec: default_betty_stale_threshold(),
+        }
+    }
+}
 
 impl Default for Server {
     fn default() -> Self {
