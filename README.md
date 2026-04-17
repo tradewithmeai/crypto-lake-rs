@@ -14,8 +14,9 @@ A lightweight, self-hosted cryptocurrency data collector and local data lake wri
 - **Configurable symbols** — add or remove any symbol per exchange in `config.yml`
 
 ### Backfill
-- **Startup backfill** — on launch, scans parquet column statistics (file footer only, no row reads) to find the most recent bar per symbol, then fetches REST API klines to fill the gap up to the current time
-- **Internal gap fill** — detects holes inside existing data (caused by mid-session crashes or outages) and fills them; runs at startup across all symbols before live collection begins
+- **Non-blocking startup** — backfill runs as a background task; live collectors start immediately on launch
+- **Trailing gap fill** — scans parquet column statistics (file footer only, no row reads) to find the most recent bar per symbol, then fetches REST API klines to fill the gap up to the current time
+- **Internal gap fill** — detects holes inside existing data (caused by mid-session crashes or outages) and fills them automatically on startup
 - **Reconnect-triggered backfill** — when a WebSocket reconnects after a gap, the collector triggers a targeted backfill for just that exchange, covering the downtime window
 - **Daily scheduled backfill** — periodic sweep to catch any remaining gaps
 - **Configurable limits** — `gap_threshold_secs`, `max_backfill_secs` (default 30 days), `timeout_secs`
@@ -50,6 +51,16 @@ A lightweight, self-hosted cryptocurrency data collector and local data lake wri
 - **System tray icon** with right-click menu (open dashboard, quit)
 - **Windows autostart** — `--install-autostart` / `--remove-autostart` registers the app to launch at login
 - **Console mode** — `--no-tray` runs without the tray icon (useful for server deployment)
+- **Background process architecture** — tray runs on the main thread (Windows requirement); all async work runs in a dedicated Tokio runtime on a second OS thread; the two communicate via shared `Arc<AtomicBool>` shutdown flag and `Arc<HealthCounters>`
+
+### Monitoring — Betty Sentinel Integration
+- **Built-in Betty agent** (`src/betty.rs`) — background tokio task that POSTs signed telemetry to a local [Betty Sentinel](https://github.com/tradewithmeai/betty-sentinel) instance every 60 seconds
+- **Heartbeat** — proves the process is alive (`POST /ingest/heartbeat`)
+- **Service state** — reports data freshness by scanning parquet file mtimes; sends `last_data_utc`, `status` (`ok`/`stale`/`unknown`), and live metrics (`bars_produced`, `ws_reconnects`, `uptime_seconds`, `last_write_age_seconds`)
+- **HMAC-SHA256 signing** — every payload is signed with a shared secret; Betty verifies before accepting
+- **Monotonic sequence numbers** — persisted to `data/reports/betty_seq.json` across restarts to satisfy Betty's replay guard
+- **Graceful degradation** — if Betty is unreachable the agent logs a warning and retries next tick; never crashes the collector
+- Configure via the `betty:` section in `config.yml`; set `enabled: false` to disable entirely
 
 ---
 
@@ -70,6 +81,7 @@ A lightweight, self-hosted cryptocurrency data collector and local data lake wri
 | System tray | tray-icon (Windows) |
 | Dashboard charts | TradingView Lightweight Charts |
 | Analysis | Python + DuckDB + pandas |
+| Monitoring | Betty Sentinel (HMAC-SHA256, hmac + sha2) |
 
 ---
 
@@ -141,6 +153,14 @@ backfill:
   max_backfill_secs: 2592000   # 30 days
   timeout_secs: 1800
 
+betty:
+  enabled: true
+  url: "http://localhost:8400"
+  agent_id: "home-desktop"
+  secret_hex: ""               # 32-byte hex — must match Betty's .env
+  interval_sec: 60
+  stale_threshold_sec: 300
+
 archive:
   provider: "rclone"
   rclone_remote: "gdrive"
@@ -171,7 +191,8 @@ data/
       BTC-USD/
         ...
   reports/
-    health.json               # last health snapshot
+    health.json               # last health snapshot (written every 60s)
+    betty_seq.json            # Betty Sentinel sequence number (persisted across restarts)
     archive_log.jsonl         # sync history
 ```
 
@@ -231,6 +252,40 @@ Lighter-weight standalone scripts for quick daily status checks and targeted gap
 
 ---
 
+## Betty Sentinel Monitoring
+
+Betty Sentinel is a local monitoring server that sends Telegram alerts when service data goes stale. The built-in Betty agent (`src/betty.rs`) runs automatically alongside the collectors.
+
+### Setup
+
+1. Generate a shared secret:
+   ```
+   python -c "import secrets; print(secrets.token_hex(32))"
+   ```
+
+2. Add to `config.yml`:
+   ```yaml
+   betty:
+     enabled: true
+     secret_hex: "<your hex string>"
+   ```
+
+3. Add the matching entry to Betty's `.env`:
+   ```
+   BETTY_AGENT_SECRET_HOME_DESKTOP=<same hex string>
+   ```
+
+4. Start Betty:
+   ```
+   uvicorn betty.api.app:app --host 0.0.0.0 --port 8400
+   ```
+
+The agent starts automatically with the app — no separate process needed. Betty will alert via Telegram if no parquet data has been written for more than 5 minutes (`stale_threshold_sec: 300`).
+
+A standalone Python alternative is also available at `tools/betty_agent.py` for testing or running outside the main process.
+
+---
+
 ## Archive and Sync
 
 Manage storage with `tools/archive.py` using [rclone](https://rclone.org) under the hood.
@@ -284,6 +339,7 @@ python tools/archive.py schedule --remove
 | `src/collector/` | WebSocket collectors (Binance, Coinbase, Kraken) and JSONL writer |
 | `src/transformer/` | Bar aggregator and Parquet writer |
 | `src/backfill.rs` | Startup, internal gap, and reconnect backfill |
+| `src/betty.rs` | Betty Sentinel agent — signed heartbeat and service-state telemetry |
 | `src/server.rs` | Axum HTTP/WebSocket server and API handlers |
 | `src/health.rs` | Atomic health counters and JSON health file writer |
 | `src/tray.rs` | Windows system tray (tray-icon) |
