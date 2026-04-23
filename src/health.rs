@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
@@ -60,6 +60,8 @@ struct DiskHealth {
 /// Spawn a periodic health writer task.
 ///
 /// Writes `{data_path}/reports/health.json` every `interval_secs`.
+/// The parquet file count is refreshed in a separate background task every
+/// 10 minutes, so the tick never blocks on a full filesystem scan.
 pub fn spawn_health_writer(
     data_path: std::path::PathBuf,
     counters: Arc<HealthCounters>,
@@ -68,6 +70,9 @@ pub fn spawn_health_writer(
     interval_secs: u64,
 ) {
     let start_time = std::time::Instant::now();
+    let parquet_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
+    spawn_parquet_count_refresher(data_path.clone(), parquet_total.clone());
 
     tokio::spawn(async move {
         let mut interval =
@@ -82,6 +87,7 @@ pub fn spawn_health_writer(
                 &exchanges,
                 symbols_count,
                 start_time.elapsed().as_secs(),
+                parquet_total.load(Ordering::Relaxed),
             )
             .await;
 
@@ -92,18 +98,51 @@ pub fn spawn_health_writer(
     });
 }
 
+/// Refresh the parquet file count in the background using blocking I/O.
+/// First scan starts immediately; subsequent scans run every 10 minutes.
+fn spawn_parquet_count_refresher(data_path: PathBuf, total: Arc<AtomicU64>) {
+    tokio::spawn(async move {
+        let parquet_dir = data_path.join("parquet");
+        loop {
+            let pd = parquet_dir.clone();
+            let count = tokio::task::spawn_blocking(move || count_parquet_files_sync(&pd))
+                .await
+                .unwrap_or(0);
+            total.store(count, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        }
+    });
+}
+
+fn count_parquet_files_sync(dir: &Path) -> u64 {
+    fn walk(dir: &Path, count: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, count);
+            } else if path.extension().map_or(false, |e| e == "parquet") {
+                *count += 1;
+            }
+        }
+    }
+    let mut count = 0u64;
+    walk(dir, &mut count);
+    count
+}
+
 async fn build_payload(
     data_path: &Path,
     counters: &HealthCounters,
     exchanges: &[String],
     symbols_count: usize,
     uptime_secs: u64,
+    parquet_total: u64,
 ) -> HealthPayload {
     let today = Utc::now().format("%Y-%m-%d").to_string();
 
-    // Count raw files for today
+    // Count raw files for today (bounded — only today's partition)
     let raw_today = count_raw_files_today(data_path, &today).await;
-    let parquet_total = count_parquet_files(data_path).await;
 
     HealthPayload {
         ts_utc: Utc::now().to_rfc3339(),
@@ -196,25 +235,3 @@ async fn count_raw_files_today(data_path: &Path, today: &str) -> u64 {
     count
 }
 
-/// Count total Parquet files under data_path/parquet/.
-async fn count_parquet_files(data_path: &Path) -> u64 {
-    let parquet_dir = data_path.join("parquet");
-    count_files_recursive(&parquet_dir, "parquet").await
-}
-
-async fn count_files_recursive(dir: &Path, extension: &str) -> u64 {
-    let mut count = 0u64;
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.is_dir() {
-            count += Box::pin(count_files_recursive(&path, extension)).await;
-        } else if path.extension().map_or(false, |e| e == extension) {
-            count += 1;
-        }
-    }
-    count
-}

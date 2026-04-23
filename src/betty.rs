@@ -132,33 +132,6 @@ fn next_sequence_sync(seq_path: &std::path::Path) -> u64 {
     next
 }
 
-// ── Parquet freshness scan ────────────────────────────────────────────────────
-
-fn latest_parquet_mtime_sync(parquet_dir: &std::path::Path) -> Option<std::time::SystemTime> {
-    fn walk(dir: &std::path::Path, latest: &mut Option<std::time::SystemTime>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, latest);
-            } else if path.extension().map_or(false, |e| e == "parquet") {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(mt) = meta.modified() {
-                        match latest {
-                            None => *latest = Some(mt),
-                            Some(l) if mt > *l => *latest = Some(mt),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let mut latest = None;
-    walk(parquet_dir, &mut latest);
-    latest
-}
-
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
 async fn post_to_betty(client: &reqwest::Client, url: &str, payload: &serde_json::Value) -> bool {
@@ -167,7 +140,8 @@ async fn post_to_betty(client: &reqwest::Client, url: &str, payload: &serde_json
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            warn!("Betty {}: HTTP {} — {}", url, status, &body[..body.len().min(200)]);
+            let preview: String = body.chars().take(200).collect();
+            warn!("Betty {}: HTTP {} — {}", url, status, preview);
             false
         }
         Err(e) => {
@@ -201,7 +175,55 @@ pub fn spawn_betty_task(
         }
     };
 
-    tokio::spawn(run_betty_loop(cfg, data_path, counters, shutdown, secret));
+    // Supervisor: if run_betty_loop ever panics or exits unexpectedly,
+    // respawn it with backoff so monitoring never silently dies.
+    tokio::spawn(async move {
+        let mut backoff_sec: u64 = 2;
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                info!("Betty supervisor: shutting down");
+                return;
+            }
+
+            let cfg_c      = cfg.clone();
+            let dp_c       = data_path.clone();
+            let counters_c = counters.clone();
+            let shutdown_c = shutdown.clone();
+            let secret_c   = secret.clone();
+
+            let handle = tokio::spawn(async move {
+                run_betty_loop(cfg_c, dp_c, counters_c, shutdown_c, secret_c).await;
+            });
+
+            match handle.await {
+                Ok(()) => {
+                    if shutdown.load(Ordering::SeqCst) {
+                        info!("Betty supervisor: inner task exited on shutdown");
+                        return;
+                    }
+                    warn!(
+                        "Betty supervisor: inner task exited unexpectedly — restarting in {}s",
+                        backoff_sec
+                    );
+                }
+                Err(e) if e.is_panic() => {
+                    warn!(
+                        "Betty supervisor: inner task panicked — restarting in {}s ({:?})",
+                        backoff_sec, e
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Betty supervisor: inner task join error — restarting in {}s ({:?})",
+                        backoff_sec, e
+                    );
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_sec)).await;
+            backoff_sec = (backoff_sec * 2).min(60);
+        }
+    });
 }
 
 async fn run_betty_loop(
@@ -222,7 +244,6 @@ async fn run_betty_loop(
         }
     };
 
-    let parquet_dir = data_path.join("parquet");
     let seq_path    = data_path.join("reports").join("betty_seq.json");
     let hostname    = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -238,6 +259,11 @@ async fn run_betty_loop(
 
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(cfg.interval_sec));
 
+    // Freshness tracked in-memory from bars_produced counter — no filesystem scan.
+    let mut last_bars: u64 = counters.bars_produced.load(Ordering::Relaxed);
+    let mut last_change_instant: Instant = Instant::now();
+    let mut last_change_utc: DateTime<Utc> = Utc::now();
+
     loop {
         ticker.tick().await;
 
@@ -246,28 +272,25 @@ async fn run_betty_loop(
             return;
         }
 
-        // ── Measure data freshness ────────────────────────────────────────────
-        let pd = parquet_dir.clone();
-        let mtime = tokio::task::spawn_blocking(move || latest_parquet_mtime_sync(&pd))
-            .await
-            .ok()
-            .flatten();
-
-        let now_sys = std::time::SystemTime::now();
-        let (status, last_data_utc, age_secs): (&str, Option<String>, f64) = match mtime {
-            None => ("unknown", None, -1.0),
-            Some(mt) => {
-                let age = now_sys.duration_since(mt).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-                let last_dt: DateTime<Utc> = mt.into();
-                let s = if age > cfg.stale_threshold_sec as f64 { "stale" } else { "ok" };
-                (s, Some(format_ts(&last_dt)), age)
-            }
-        };
-
         // ── Read counters ─────────────────────────────────────────────────────
         let bars       = counters.bars_produced.load(Ordering::Relaxed);
         let reconnects = counters.ws_reconnects.load(Ordering::Relaxed);
         let uptime     = start.elapsed().as_secs();
+
+        // ── Measure data freshness (from counter, not filesystem) ─────────────
+        if bars > last_bars {
+            last_bars = bars;
+            last_change_instant = Instant::now();
+            last_change_utc = Utc::now();
+        }
+        let age_secs = last_change_instant.elapsed().as_secs_f64();
+        let (status, last_data_utc): (&str, Option<String>) = if bars == 0 && uptime < 120 {
+            ("unknown", None)
+        } else if age_secs > cfg.stale_threshold_sec as f64 {
+            ("stale", Some(format_ts(&last_change_utc)))
+        } else {
+            ("ok", Some(format_ts(&last_change_utc)))
+        };
 
         // ── Sequence numbers (blocking file I/O) ──────────────────────────────
         let sp1 = seq_path.clone();

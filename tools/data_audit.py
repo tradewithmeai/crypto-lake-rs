@@ -12,8 +12,8 @@ import duckdb
 
 DATA_ROOT = Path(__file__).parent.parent / "data" / "parquet"
 # Determine actual start date from directory structure
-START_DATE = date(2026, 3, 21)
-END_DATE   = date(2026, 4, 10)
+START_DATE = date(2026, 4, 11)  # incremental — old audit covers Mar21-Apr10
+END_DATE   = date(2026, 4, 22)  # yesterday — today's partition still being written
 
 EXCHANGES = {
     "binance":  sorted(["ADAUSDT","AVAXUSDT","BNBUSDT","BTCUSDT","DOGEUSDT",
