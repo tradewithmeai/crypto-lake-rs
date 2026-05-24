@@ -5,6 +5,7 @@ mod collector;
 mod config;
 mod events;
 mod health;
+mod indicators;
 mod server;
 mod transformer;
 #[cfg(windows)]
