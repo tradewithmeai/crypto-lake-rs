@@ -176,7 +176,11 @@ async fn backfill_exchange(
         }
 
         // ── Phase 2: fill trailing gap (latest bar → now) ────────────────────
-        let last_ts = scan_latest_timestamp(data_path, exchange_name, &safe_symbol).await;
+        // Pass `now` so the scan ignores live data written by the current session.
+        // Without this, once the live collector has flushed its first file, the
+        // scan finds current-session data and reports gap_secs ≈ 0, skipping the
+        // fill for any gap that existed when the app started.
+        let last_ts = scan_latest_timestamp(data_path, exchange_name, &safe_symbol, now).await;
 
         let gap_secs = match last_ts {
             Some(ts) => now - ts,
@@ -390,11 +394,17 @@ async fn find_internal_gaps(
     gaps
 }
 
-/// Scan parquet files to find the most recent `window_start` timestamp for an exchange/symbol.
+/// Scan parquet files to find the most recent `window_start` timestamp for an exchange/symbol
+/// that is strictly older than `before_secs`.
+///
+/// The `before_secs` parameter must be set to the backfill startup time so that files
+/// written by the current live session are excluded. Without this boundary the scan
+/// finds live-session data and reports no trailing gap even when one exists.
 async fn scan_latest_timestamp(
     data_path: &Path,
     exchange: &str,
     symbol: &str,
+    before_secs: i64,
 ) -> Option<i64> {
     let parquet_dir = data_path.join("parquet").join(exchange).join(symbol);
 
@@ -402,16 +412,18 @@ async fn scan_latest_timestamp(
         return None;
     }
 
-    // Walk year/month/day directories in reverse to find most recent data
+    // Walk all year/month/day directories newest-first; stop as soon as we have
+    // found at least one qualifying timestamp and the current dir is entirely older
+    // than before_secs (meaning all earlier dirs will be even older — no need to scan).
     let mut latest_ts: Option<i64> = None;
 
-    // Collect and sort partition dirs (year=YYYY/month=MM/day=DD)
     let mut partition_dirs = Vec::new();
     collect_leaf_dirs(&parquet_dir, &mut partition_dirs);
     partition_dirs.sort();
     partition_dirs.reverse();
 
-    for dir in partition_dirs.iter().take(3) {
+    for dir in partition_dirs.iter() {
+        let mut dir_had_qualifying = false;
         // Read parquet files in this directory
         let mut entries = match tokio::fs::read_dir(dir).await {
             Ok(e) => e,
@@ -424,10 +436,20 @@ async fn scan_latest_timestamp(
                 continue;
             }
 
-            // Use the new unified range reader; we only need the max here
+            // Only count data that pre-dates the current session.
             if let Some((_mn, mx)) = read_file_ts_range(&path) {
-                latest_ts = Some(latest_ts.map_or(mx, |prev: i64| prev.max(mx)));
+                if mx < before_secs {
+                    latest_ts = Some(latest_ts.map_or(mx, |prev: i64| prev.max(mx)));
+                    dir_had_qualifying = true;
+                }
             }
+        }
+
+        // Once we have found qualifying data and moved into a directory that is
+        // entirely older than before_secs, all subsequent (older) directories
+        // will also qualify but cannot produce a later timestamp — stop early.
+        if dir_had_qualifying && latest_ts.is_some() {
+            break;
         }
     }
 
