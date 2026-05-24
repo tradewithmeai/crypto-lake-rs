@@ -57,6 +57,19 @@ struct Cli {
     /// Remove auto-start from Windows boot and exit
     #[arg(long)]
     remove_autostart: bool,
+
+    /// One-shot deep historical backfill using Binance 1m bars, then exit.
+    /// Skips days that already have parquet files.
+    #[arg(long)]
+    deep_backfill: bool,
+
+    /// Symbol to deep-backfill (used with --deep-backfill)
+    #[arg(long, default_value = "BTCUSDT")]
+    symbol: String,
+
+    /// Start date for deep backfill, YYYY-MM-DD (used with --deep-backfill)
+    #[arg(long, default_value = "2020-01-01")]
+    from: String,
 }
 
 fn main() {
@@ -169,6 +182,18 @@ fn main() {
     let counters = Arc::new(HealthCounters::default());
     let shutdown = Arc::new(AtomicBool::new(false));
     let exchange_names: Vec<String> = cfg.exchanges.iter().map(|e| e.name.clone()).collect();
+
+    // One-shot deep backfill — runs, then exits.
+    if cli.deep_backfill {
+        let rest_url = cfg
+            .exchange("binance")
+            .map(|e| e.rest_url.clone())
+            .unwrap_or_else(|| "https://api.binance.com/api/v3".to_string());
+        let compression = cfg.transformer.parquet_compression.clone();
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(backfill::run_deep(&cli.symbol, &cli.from, &data_path, &rest_url, &compression));
+        return;
+    }
 
     // On Windows, use system tray mode by default
     #[cfg(windows)]

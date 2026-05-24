@@ -2,7 +2,7 @@ use crate::config::{Backfill, Exchange};
 use crate::transformer::aggregator::Bar1s;
 use crate::transformer::parquet_writer;
 use arrow::array::Array;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::statistics::Statistics;
 use serde_json::Value;
@@ -736,4 +736,191 @@ fn parse_f64(v: &Value) -> f64 {
     v.as_f64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         .unwrap_or(0.0)
+}
+
+// ── Deep historical backfill ────────────────────────────────────────────────
+
+/// One-shot deep historical backfill for a single Binance symbol using 1m bars.
+///
+/// Iterates day-by-day from `from_date` to yesterday (today excluded — live
+/// collection covers it). Skips any day that already has parquet files in the
+/// expected partition directory so the command is safe to re-run.
+///
+/// Run as: `crypto-lake-rs --deep-backfill --symbol BTCUSDT --from 2020-01-01`
+pub async fn run_deep(
+    symbol: &str,
+    from_date: &str,
+    data_path: &Path,
+    rest_url: &str,
+    compression: &str,
+) {
+    let start_date = match NaiveDate::parse_from_str(from_date, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Deep backfill: invalid --from date '{}': {}", from_date, e);
+            return;
+        }
+    };
+
+    let yesterday = (Utc::now() - Duration::days(1)).date_naive();
+    if start_date > yesterday {
+        info!("Deep backfill: from_date {} is not before yesterday, nothing to do", from_date);
+        return;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    let total_days = (yesterday - start_date).num_days() + 1;
+    info!(
+        "Deep backfill: {} — {} days ({} to {})",
+        symbol, total_days, start_date, yesterday
+    );
+
+    let mut d = start_date;
+    let mut fetched_bars: u64 = 0;
+    let mut skipped_days: u64 = 0;
+    let mut day_num: u64 = 0;
+
+    while d <= yesterday {
+        day_num += 1;
+
+        let partition = data_path
+            .join("parquet")
+            .join("binance")
+            .join(symbol)
+            .join(format!("year={}", d.year()))
+            .join(format!("month={:02}", d.month()))
+            .join(format!("day={:02}", d.day()));
+
+        if partition.exists() && deep_backfill_day_has_parquet(&partition) {
+            skipped_days += 1;
+            d += Duration::days(1);
+            continue;
+        }
+
+        // Fetch the full UTC day in 1m bars
+        let day_start = d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let day_end   = d.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp();
+
+        if day_num % 30 == 1 {
+            info!(
+                "Deep backfill: {} {}/{} — {}",
+                symbol, day_num, total_days, d
+            );
+        }
+
+        let bars = match fetch_binance_1m(&client, rest_url, symbol, day_start, day_end).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Deep backfill: {} {} — fetch error: {}", symbol, d, e);
+                d += Duration::days(1);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        if !bars.is_empty() {
+            fetched_bars += bars.len() as u64;
+            if let Err(e) = parquet_writer::write_bars(&bars, data_path, compression).await {
+                warn!("Deep backfill: {} {} — write error: {}", symbol, d, e);
+            }
+        }
+
+        d += Duration::days(1);
+        // Small pause between days to respect Binance rate limits
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    info!(
+        "Deep backfill complete: {} — {} bars written, {} days already present (skipped)",
+        symbol, fetched_bars, skipped_days
+    );
+}
+
+fn deep_backfill_day_has_parquet(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("parquet"))
+        })
+        .unwrap_or(false)
+}
+
+/// Fetch 1-minute OHLCV bars from Binance REST API.
+///
+/// Uses the same `/api/v3/klines` endpoint as `fetch_binance` but with
+/// `interval=1m`. Returns 1000 bars per request; paginates until `end_ts`.
+async fn fetch_binance_1m(
+    client: &reqwest::Client,
+    rest_url: &str,
+    symbol: &str,
+    start_ts: i64,
+    end_ts: i64,
+) -> Result<Vec<Bar1s>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut all_bars = Vec::new();
+    let mut cursor = start_ts * 1000; // Binance uses milliseconds
+    let end_ms = end_ts * 1000;
+
+    while cursor < end_ms {
+        let url = format!(
+            "{}/klines?symbol={}&interval=1m&startTime={}&endTime={}&limit=1000",
+            rest_url, symbol, cursor, end_ms
+        );
+
+        let resp: Value = client.get(&url).send().await?.json().await?;
+
+        let klines = match resp.as_array() {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => break,
+        };
+
+        let mut last_open_time = cursor;
+        for kline in klines {
+            let arr = match kline.as_array() {
+                Some(a) if a.len() >= 11 => a,
+                _ => continue,
+            };
+
+            let open_time_ms = arr[0].as_i64().unwrap_or(0);
+            let open         = parse_f64(&arr[1]);
+            let high         = parse_f64(&arr[2]);
+            let low          = parse_f64(&arr[3]);
+            let close        = parse_f64(&arr[4]);
+            let volume       = parse_f64(&arr[5]);
+            let quote_volume = parse_f64(&arr[7]);
+            let trade_count  = arr[8].as_u64().unwrap_or(0);
+            let vwap = if volume > 0.0 { quote_volume / volume } else { close };
+
+            all_bars.push(Bar1s {
+                exchange: "binance".to_string(),
+                symbol: symbol.to_string(),
+                ts: open_time_ms / 1000,
+                open,
+                high,
+                low,
+                close,
+                volume_base: volume,
+                volume_quote: quote_volume,
+                trade_count,
+                vwap,
+                bid: 0.0,
+                ask: 0.0,
+                spread: 0.0,
+                source: "backfill_1m".to_string(),
+            });
+
+            last_open_time = open_time_ms;
+        }
+
+        // Advance cursor past the last returned bar
+        cursor = last_open_time + 60_000; // +1 minute in ms
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    Ok(all_bars)
 }
