@@ -189,59 +189,78 @@ async fn read_parquet_bars(
     tf_seconds: i64,
     limit: usize,
 ) -> Result<Vec<BarRow>, Box<dyn std::error::Error + Send + Sync>> {
-    use arrow::array::TimestampMicrosecondArray;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    // Calculate how many minute-files we need.
+    // Each file covers ~60 seconds. For limit bars at tf_seconds each:
+    //   needed_minutes = limit * tf_seconds / 60
+    // Cap at 3000 files (~50 hours of 1m files, ~2 days of 1s files).
+    let needed_files = ((limit as i64 * tf_seconds / 60) as usize + limit / 4 + 5).min(3000);
 
     let mut parquet_files: Vec<PathBuf> = Vec::new();
     collect_parquet_files(sym_dir, &mut parquet_files).await;
 
-    // Sort by filename descending (newest first) and take only recent files
+    // Sort descending (newest first), keep only what we need
     parquet_files.sort_by(|a, b| b.cmp(a));
-    parquet_files.truncate(10); // Only read the 10 most recent files
+    parquet_files.truncate(needed_files);
 
-    // (ts_sec, open, high, low, close, volume, trade_count, vwap)
-    let mut raw_bars: Vec<(i64, f64, f64, f64, f64, f64, u64, f64)> = Vec::new();
+    if parquet_files.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    for file_path in &parquet_files {
-        let path = file_path.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, f64, f64, f64, f64, f64, u64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
-            let file = std::fs::File::open(&path)?;
-            let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-                .build()?;
+    // Read all files in parallel via the blocking thread pool
+    type RawRow = (i64, f64, f64, f64, f64, f64, u64, f64);
+    let handles: Vec<_> = parquet_files
+        .into_iter()
+        .map(|path| {
+            tokio::task::spawn_blocking(move || -> Vec<RawRow> {
+                use arrow::array::TimestampMicrosecondArray;
+                use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-            let mut rows = Vec::new();
-            for batch in reader {
-                let batch = batch?;
-                let ts_col = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>();
-                let open_col = batch.column(3).as_any().downcast_ref::<arrow::array::Float64Array>();
-                let high_col = batch.column(4).as_any().downcast_ref::<arrow::array::Float64Array>();
-                let low_col = batch.column(5).as_any().downcast_ref::<arrow::array::Float64Array>();
-                let close_col = batch.column(6).as_any().downcast_ref::<arrow::array::Float64Array>();
-                let vol_col = batch.column(7).as_any().downcast_ref::<arrow::array::Float64Array>();
-                let count_col = batch.column(9).as_any().downcast_ref::<arrow::array::UInt64Array>();
-                let vwap_col = batch.column(10).as_any().downcast_ref::<arrow::array::Float64Array>();
+                let file = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(_) => return Vec::new(),
+                };
+                let reader = match ParquetRecordBatchReaderBuilder::try_new(file).and_then(|b| b.build()) {
+                    Ok(r) => r,
+                    Err(_) => return Vec::new(),
+                };
+                let mut rows = Vec::new();
+                for batch in reader.flatten() {
+                    let ts_col  = batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>();
+                    let open_col  = batch.column(3).as_any().downcast_ref::<arrow::array::Float64Array>();
+                    let high_col  = batch.column(4).as_any().downcast_ref::<arrow::array::Float64Array>();
+                    let low_col   = batch.column(5).as_any().downcast_ref::<arrow::array::Float64Array>();
+                    let close_col = batch.column(6).as_any().downcast_ref::<arrow::array::Float64Array>();
+                    let vol_col   = batch.column(7).as_any().downcast_ref::<arrow::array::Float64Array>();
+                    let count_col = batch.column(9).as_any().downcast_ref::<arrow::array::UInt64Array>();
+                    let vwap_col  = batch.column(10).as_any().downcast_ref::<arrow::array::Float64Array>();
 
-                if let (Some(ts), Some(o), Some(h), Some(l), Some(c), Some(v), Some(cnt), Some(vw)) =
-                    (ts_col, open_col, high_col, low_col, close_col, vol_col, count_col, vwap_col)
-                {
-                    for i in 0..batch.num_rows() {
-                        let ts_us = ts.value(i);
-                        let ts_sec = ts_us / 1_000_000;
-                        rows.push((ts_sec, o.value(i), h.value(i), l.value(i), c.value(i), v.value(i), cnt.value(i), vw.value(i)));
+                    if let (Some(ts), Some(o), Some(h), Some(l), Some(c), Some(v), Some(cnt), Some(vw)) =
+                        (ts_col, open_col, high_col, low_col, close_col, vol_col, count_col, vwap_col)
+                    {
+                        for i in 0..batch.num_rows() {
+                            let ts_sec = ts.value(i) / 1_000_000;
+                            rows.push((ts_sec, o.value(i), h.value(i), l.value(i), c.value(i), v.value(i), cnt.value(i), vw.value(i)));
+                        }
                     }
                 }
-            }
-            Ok(rows)
-        }).await??;
+                rows
+            })
+        })
+        .collect();
 
-        raw_bars.extend(result);
+    // (ts_sec, open, high, low, close, volume, trade_count, vwap)
+    let mut raw_bars: Vec<RawRow> = Vec::new();
+    for handle in handles {
+        if let Ok(rows) = handle.await {
+            raw_bars.extend(rows);
+        }
     }
 
     if raw_bars.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Aggregate 1s bars into requested timeframe.
+    // Aggregate raw 1s bars into the requested timeframe.
     // Map value: (open, high, low, close, vol, cnt, vwap_notional, vol_for_vwap)
     let mut agg: HashMap<i64, (f64, f64, f64, f64, f64, u64, f64, f64)> = HashMap::new();
     for (ts, o, h, l, c, v, cnt, vwap) in &raw_bars {

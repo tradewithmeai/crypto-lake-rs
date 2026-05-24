@@ -300,12 +300,12 @@ async function loadChartData() {
         // Gap markers
         const expected = TF_SEC[state.tf] || 300;
         const gaps = [];
-        for (let i = 1; i < candles.length; i++) {
-            const diff = candles[i].time - candles[i - 1].time;
+        for (let i = 1; i < processed.length; i++) {
+            const diff = processed[i].time - processed[i - 1].time;
             if (diff > expected * 1.5) {
                 const mins = Math.round(diff / 60);
                 gaps.push({
-                    time: candles[i - 1].time,
+                    time: processed[i - 1].time,
                     position: 'belowBar',
                     color: '#e8a020',
                     shape: 'arrowUp',
@@ -439,6 +439,9 @@ function onTrade(trade) {
     addTickerTrade(trade);
 }
 
+// rAF throttle flag — only one pending chart repaint at a time
+let _chartRafPending = false;
+
 function updateChart(trade) {
     if (!state.candleSeries) return;
     const price = trade.price;
@@ -459,22 +462,31 @@ function updateChart(trade) {
         state.currentVolume += qty;
     }
 
-    state.candleSeries.update(state.currentCandle);
-    state.volumeSeries.update({
-        time: candleStart,
-        value: state.currentVolume,
-        color: state.currentCandle.close >= state.currentCandle.open
-            ? 'rgba(52,211,153,0.25)' : 'rgba(248,113,113,0.25)',
-    });
-
-    // Keep state.bars in sync with live candle (update or append last bar)
+    // Keep state.bars in sync immediately (for indicator math)
     const liveBar = { ...state.currentCandle, volume: state.currentVolume, vwap: state.currentCandle.close };
     if (state.bars.length > 0 && state.bars[state.bars.length - 1].time === candleStart) {
         state.bars[state.bars.length - 1] = liveBar;
     } else if (state.bars.length === 0 || candleStart > state.bars[state.bars.length - 1].time) {
         state.bars.push(liveBar);
     }
-    updateLiveIndicators(liveBar);
+
+    // Throttle visual chart updates to animation frames (~60fps)
+    if (!_chartRafPending) {
+        _chartRafPending = true;
+        requestAnimationFrame(() => {
+            _chartRafPending = false;
+            if (!state.currentCandle) return;
+            state.candleSeries.update(state.currentCandle);
+            state.volumeSeries.update({
+                time: state.currentCandleTime,
+                value: state.currentVolume,
+                color: state.currentCandle.close >= state.currentCandle.open
+                    ? 'rgba(52,211,153,0.25)' : 'rgba(248,113,113,0.25)',
+            });
+            const bar = state.bars[state.bars.length - 1];
+            if (bar) updateLiveIndicators(bar);
+        });
+    }
 }
 
 // ── Trade ticker (system tab) ─────────────────────────────────────────────
