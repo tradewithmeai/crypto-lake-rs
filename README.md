@@ -39,13 +39,87 @@ A lightweight, self-hosted cryptocurrency data collector and local data lake wri
 - **Feed indicator** — visual live/disconnected status
 
 ### REST & WebSocket API
+
+Base URL: `http://localhost:8000`
+
+#### Core endpoints
+
 | Endpoint | Description |
 |---|---|
-| `GET /api/v1/symbols` | List all configured exchange/symbol pairs |
-| `GET /api/v1/bars/:symbol/latest?tf=5m&limit=500` | OHLCV bars for a symbol, resampled to `tf` |
-| `GET /api/v1/health` | Health counters + disk usage |
-| `GET /api/v1/analysis/summary` | Per-symbol bar count, completeness, and gap summary |
-| `GET /api/v1/ws/stream` | WebSocket — real-time trade events |
+| `GET /` | Live candlestick dashboard (TradingView Lightweight Charts) |
+| `GET /api/v1/symbols` | Exchange → symbol list from config |
+| `GET /api/v1/bars/:symbol/latest?tf=5m&limit=500` | OHLCV bars resampled to `tf`; newest-first; merges all exchanges |
+| `GET /api/v1/health` | Live collector counters (messages, trades, bars, reconnects) |
+| `GET /api/v1/analysis/summary` | Per-symbol parquet stats — bar counts, completeness, earliest/latest timestamp |
+| `WS /api/v1/ws/stream?symbols=BTCUSDT,ETHUSDT` | Real-time trade events; omit `symbols` for all |
+
+#### Agent endpoints
+
+Designed for LLM trading agent consumption. All accept `?exchange=` to disambiguate symbols that exist on multiple exchanges (e.g. `BTC-USD` on both Coinbase and Kraken).
+
+**`GET /api/v1/indicators/:symbol?tf=5m&limit=200&exchange=binance`**
+
+Pre-computed technical indicators with signal labels. In-progress bar is dropped before computation; volume ratio uses only `source='live'` bars.
+
+| Indicator | Signal values |
+|---|---|
+| `rsi` (14) | `oversold`, `neutral`, `overbought` |
+| `macd` (12,26,9) | `direction`: `bullish_accelerating`, `bullish_weakening`, `bearish_weakening`, `bearish_accelerating` |
+| `bollinger` (20,2) | `position` 0–1 float + `near_upper`, `upper_half`, `lower_half`, `near_lower` |
+| `sma` 20/50/200 | `trend`: `bullish_aligned`, `bearish_aligned`, `mixed` |
+| `ema` 12/26 | `signal`: `bullish`, `bullish_crossover`, `bearish`, `bearish_crossover` |
+| `vwap` | `price_vs_vwap`: `above` / `below` |
+| `volume` | `ratio` vs 20-bar avg + `elevated`, `normal`, `low` |
+
+Also returns top-level `regime` label and `confidence` derived from signal-agreement ratio.
+
+---
+
+**`GET /api/v1/derivatives/:symbol?exchange=binance`**
+
+Proxies Binance Futures REST locally — no external calls from the agent. Results cached 30 seconds.
+
+| Field | Source |
+|---|---|
+| `funding.rate` + `rate_8h_annualised` | `/fapi/v1/fundingRate` |
+| `funding.next_funding_time`, `funding.signal` | |
+| `open_interest.value_contracts` | `/fapi/v1/openInterest` |
+| `long_short_ratio.value` + `signal` | `/futures/data/globalLongShortAccountRatio` |
+| `mark_price`, `change_24h_pct` | `/fapi/v1/ticker/24hr` |
+
+Returns `null` fields for symbols with no perpetual listing (e.g. `EURUSDT`). Returns `404` for non-Binance symbols.
+
+---
+
+**`GET /api/v1/snapshot/:symbol?tf=5m&exchange=binance`**
+
+Single round-trip — full context for the agent. Parquet read and Binance Futures fetch run in parallel.
+
+| Section | Contents |
+|---|---|
+| `price` | `last`, `open_24h`, `change_24h_pct`, `high_24h`, `low_24h` |
+| `volume` | `volume_24h_base`, `trade_count_24h`, `vwap_24h` |
+| `indicators` | Full indicator block (same as `/indicators`) |
+| `derivatives` | Full derivatives block; `null` for non-Binance symbols |
+| `regime.label` | `bullish_momentum`, `bullish_bias`, `neutral_ranging`, `bearish_bias`, `bearish_momentum` |
+| `regime.confidence` | `high` (≥6/7 signals agree), `medium` (4–5), `low` (close split) |
+| `regime.basis` | Contributing signals e.g. `["price_above_vwap", "positive_funding"]` |
+| `bars_sample` | Last 5 complete bars: `ts, open, high, low, close, volume, vwap` |
+
+---
+
+**`GET /api/v1/scan?exchange=binance&sort=momentum&limit=10`**
+
+Scans all symbols for an exchange in parallel and ranks by criterion. Results cached 60 seconds.
+
+| `sort` | Ranks by |
+|---|---|
+| `momentum` | RSI direction × MACD sign × price vs SMA20 |
+| `volume` | 20-bar volume ratio — highest relative volume first |
+| `volatility` | BB width / midpoint — widest bands first (breakout candidates) |
+| `rsi_extreme` | Distance from RSI 50 either direction |
+
+Returns `rank, symbol, score, price, change_24h_pct, rsi, macd_direction, volume_ratio, bb_position, regime` per result. `limit` capped at 20.
 
 ### Windows Integration
 - **System tray icon** with right-click menu (open dashboard, quit)
@@ -341,6 +415,7 @@ python tools/archive.py schedule --remove
 | `src/backfill.rs` | Startup, internal gap, and reconnect backfill |
 | `src/betty.rs` | Betty Sentinel agent — signed heartbeat and service-state telemetry |
 | `src/server.rs` | Axum HTTP/WebSocket server and API handlers |
+| `src/indicators.rs` | Pure Rust indicator math — SMA, EMA, RSI, Bollinger Bands, MACD |
 | `src/health.rs` | Atomic health counters and JSON health file writer |
 | `src/tray.rs` | Windows system tray (tray-icon) |
 | `src/autostart.rs` | Windows registry autostart install/remove |
