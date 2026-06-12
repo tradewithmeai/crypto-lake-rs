@@ -1,0 +1,17 @@
+[Unit]
+Description=crypto-lake-rs collector + dashboard/API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit User/Group/paths for your deployment.
+User=kc-user
+Group=kc-user
+WorkingDirectory=/home/kc-user/crypto-lake-rs
+ExecStart=/home/kc-user/crypto-lake-rs/target/release/crypto-lake-rs --config config.yml --no-tray --retention-days 0
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
